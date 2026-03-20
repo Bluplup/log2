@@ -29,7 +29,7 @@ from threading import Thread
 #  AYARLAR
 # ─────────────────────────────────────────
 
-BOT_TOKEN    = "BOT_TOKEN_BURAYA"   # Bot tokenınızı buraya girin
+   # Bot tokenınızı buraya girin
 AYAR_DOSYASI = "settings.json"      # Kanal ID'leri burada saklanır
 
 # Desteklenen log türleri ve açıklamaları
