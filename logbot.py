@@ -29,10 +29,13 @@ from threading import Thread
 #  AYARLAR
 # ─────────────────────────────────────────
 
+# Token environment variable'dan okunur
+# Render: Dashboard → Environment → BOT_TOKEN ekle
+# Lokal:  export BOT_TOKEN="token_buraya"  (Linux/Mac)
+#         set BOT_TOKEN=token_buraya       (Windows)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable ayarlanmamış!")
-    # Bot tokenınızı buraya girin
+    raise ValueError("BOT_TOKEN environment variable ayarlanmamis! Render'da Environment sekmesine ekle.")
 AYAR_DOSYASI = "settings.json"      # Kanal ID'leri burada saklanır
 
 # Desteklenen log türleri ve açıklamaları
@@ -886,15 +889,92 @@ async def on_guild_channel_delete(kanal: discord.abc.GuildChannel):
     await log_gonder(kanal.guild, "kanal_log", embed)
 
 
+def kanal_izin_farklarini_bul(onceki: discord.abc.GuildChannel, sonraki: discord.abc.GuildChannel):
+    """
+    İki kanal arasındaki izin (overwrite) farklarını bulur.
+
+    Kanal izinleri rol/üye bazlı OverwriteType nesneleridir.
+    Her overwrite'ın allow ve deny listeleri karşılaştırılır:
+        - Yeni eklenmiş overwrite  → o rol/üye için yeni izin ayarı yapılmış
+        - Silinmiş overwrite       → o rol/üye için izin ayarı kaldırılmış
+        - Değişmiş overwrite       → allow/deny değerleri farklılaşmış
+
+    Döndürür:
+        list[str] — okunabilir değişiklik satırları
+    """
+    satirlar = []
+
+    eski_ow = dict(onceki.overwrites)   # {rol/üye: PermissionOverwrite}
+    yeni_ow = dict(sonraki.overwrites)
+
+    tum_hedefler = set(eski_ow) | set(yeni_ow)
+
+    for hedef in tum_hedefler:
+        eski = eski_ow.get(hedef)
+        yeni = yeni_ow.get(hedef)
+
+        hedef_adi = f"@{hedef.name}" if hasattr(hedef, 'name') else str(hedef)
+
+        if eski is None and yeni is not None:
+            # Yeni overwrite eklendi
+            izinler = [izin_adi_getir(p) for p, v in iter(yeni) if v is not None]
+            satirlar.append(f"➕ **{hedef_adi}** için izin ayarı eklendi")
+
+        elif eski is not None and yeni is None:
+            # Overwrite tamamen silindi
+            satirlar.append(f"➖ **{hedef_adi}** için izin ayarı kaldırıldı")
+
+        else:
+            # Her iki tarafta da var, farkları bul
+            eklenen_izinler  = []
+            kaldirilan_izinler = []
+            reddedilen_izinler = []
+            red_kaldirilan   = []
+
+            for perm, yeni_deger in iter(yeni):
+                eski_deger = getattr(eski, perm, None)
+                if eski_deger == yeni_deger:
+                    continue
+
+                ad = izin_adi_getir(perm)
+
+                if yeni_deger is True and eski_deger is not True:
+                    eklenen_izinler.append(ad)       # ✅ İzin verildi
+                elif yeni_deger is False and eski_deger is not False:
+                    reddedilen_izinler.append(ad)    # ❌ İzin reddedildi
+                elif yeni_deger is None:
+                    if eski_deger is True:
+                        kaldirilan_izinler.append(ad)   # ✅ kaldırıldı → nötr
+                    elif eski_deger is False:
+                        red_kaldirilan.append(ad)       # ❌ kaldırıldı → nötr
+
+            if any([eklenen_izinler, kaldirilan_izinler, reddedilen_izinler, red_kaldirilan]):
+                satirlar.append(f"🔧 **{hedef_adi}** izinleri değişti:")
+                if eklenen_izinler:
+                    satirlar.append("  `✅` " + ", ".join(eklenen_izinler))
+                if reddedilen_izinler:
+                    satirlar.append("  `❌` " + ", ".join(reddedilen_izinler))
+                if kaldirilan_izinler:
+                    satirlar.append("  `↩️` Nötre alındı: " + ", ".join(kaldirilan_izinler))
+                if red_kaldirilan:
+                    satirlar.append("  `↩️` Red kaldırıldı: " + ", ".join(red_kaldirilan))
+
+    return satirlar
+
+
 @bot.event
 async def on_guild_channel_update(onceki: discord.abc.GuildChannel, sonraki: discord.abc.GuildChannel):
-    """Bir kanalın adı veya ayarları değiştiğinde tetiklenir."""
+    """
+    Bir kanalın adı, ayarları veya izinleri değiştiğinde tetiklenir.
+    Genel değişiklikler ve izin (overwrite) değişiklikleri ayrı embedler olarak gönderilir.
+    """
+
+    # ── 1. Genel ayar değişiklikleri ────────────────────────
     degisiklikler = []
 
     if onceki.name != sonraki.name:
         degisiklikler.append(f"📝 İsim: `{onceki.name}` → `{sonraki.name}`")
 
-    # Metin kanalına özel: topic değişikliği
     if isinstance(onceki, discord.TextChannel) and isinstance(sonraki, discord.TextChannel):
         if onceki.topic != sonraki.topic:
             eski = onceki.topic or "*(boş)*"
@@ -905,21 +985,54 @@ async def on_guild_channel_update(onceki: discord.abc.GuildChannel, sonraki: dis
         if onceki.nsfw != sonraki.nsfw:
             degisiklikler.append(f"🔞 NSFW: `{onceki.nsfw}` → `{sonraki.nsfw}`")
 
-    if not degisiklikler:
-        return  # Önemli bir değişiklik yok
+    if degisiklikler:
+        sorumlu = await audit_log_bul(sonraki.guild, discord.AuditLogAction.channel_update, hedef=sonraki)
+        embed = discord.Embed(
+            title="✏️ Kanal Güncellendi",
+            color=RENKLER["bilgi"],
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="📍 Kanal",         value=sonraki.mention,                                        inline=True)
+        embed.add_field(name="🛡️ İşlemi Yapan",  value=sorumlu.mention if sorumlu else "⚠️ Bilinmiyor",        inline=True)
+        embed.add_field(name="🔄 Değişiklikler", value="\n".join(degisiklikler),                                inline=False)
+        embed.set_footer(text=zaman_damgasi())
+        await log_gonder(sonraki.guild, "kanal_log", embed)
 
-    sorumlu = await audit_log_bul(sonraki.guild, discord.AuditLogAction.channel_update, hedef=sonraki)
+    # ── 2. İzin (overwrite) değişiklikleri ──────────────────
+    izin_satirlari = kanal_izin_farklarini_bul(onceki, sonraki)
 
-    embed = discord.Embed(
-        title="✏️ Kanal Güncellendi",
-        color=RENKLER["bilgi"],
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.add_field(name="📍 Kanal",         value=sonraki.mention,                                          inline=True)
-    embed.add_field(name="🛡️ İşlemi Yapan",  value=sorumlu.mention if sorumlu else "⚠️ Bilinmiyor",          inline=True)
-    embed.add_field(name="🔄 Değişiklikler", value="\n".join(degisiklikler),                                  inline=False)
-    embed.set_footer(text=zaman_damgasi())
-    await log_gonder(sonraki.guild, "kanal_log", embed)
+    if izin_satirlari:
+        sorumlu = await audit_log_bul(sonraki.guild, discord.AuditLogAction.overwrite_update, hedef=sonraki)
+
+        # Discord embed field değeri max 1024 karakter, uzunsa böl
+        parca = ""
+        parcalar = []
+        for satir in izin_satirlari:
+            if len(parca) + len(satir) + 1 > 1000:
+                parcalar.append(parca)
+                parca = satir
+            else:
+                parca += ("\n" if parca else "") + satir
+        if parca:
+            parcalar.append(parca)
+
+        embed = discord.Embed(
+            title="🔐 Kanal İzinleri Değişti",
+            color=RENKLER["izin"],
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="📍 Kanal",        value=sonraki.mention,                                        inline=True)
+        embed.add_field(name="🛡️ İşlemi Yapan", value=sorumlu.mention if sorumlu else "⚠️ Bilinmiyor",        inline=True)
+
+        for i, parca in enumerate(parcalar):
+            embed.add_field(
+                name="🔄 Değişiklikler" if i == 0 else "\u200b",
+                value=parca,
+                inline=False
+            )
+
+        embed.set_footer(text=zaman_damgasi())
+        await log_gonder(sonraki.guild, "kanal_log", embed)
 
 
 # ─────────────────────────────────────────
@@ -954,7 +1067,11 @@ async def on_ready():
         )
     )
 
-# ================= FLASK (REPLIT PREVIEW İÇİN) =================
+
+# ─────────────────────────────────────────
+#  FLASK (RENDER CANLI TUTMAK İÇİN)
+# ─────────────────────────────────────────
+
 app = Flask(__name__)
 
 @app.route("/")
