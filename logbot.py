@@ -29,7 +29,10 @@ from threading import Thread
 #  AYARLAR
 # ─────────────────────────────────────────
 
-   # Bot tokenınızı buraya girin
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable ayarlanmamış!")
+    # Bot tokenınızı buraya girin
 AYAR_DOSYASI = "settings.json"      # Kanal ID'leri burada saklanır
 
 # Desteklenen log türleri ve açıklamaları
@@ -959,7 +962,7 @@ def home():
     return "Bot çalışıyor"
 
 def run_flask():
-    port = int(os.environ.get("PORT", 3000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
 Thread(target=run_flask).start()
