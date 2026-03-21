@@ -54,6 +54,11 @@ DEFAULT_LOG_KANALLARI = {
     "davet_log":   1484564912486355106,
 }
 
+# Partner kanalı ID'si (partner textinin atıldığı kanal)
+# Değiştirmek istersen buraya yaz
+DEFAULT_PARTNER_TEXT_KANALI = 1396219864279945397
+DEFAULT_PARTNER_LOG_KANALI  = 1484813767253430363
+
 # ── Sabit Log Kanalları ──────────────────────────────────────────
 # Bu kanallar her deploy sonrası otomatik yüklenir.
 # Değiştirmek istersen buradan düzenle.
@@ -1140,6 +1145,15 @@ async def on_ready():
                     ))
                 except Exception:
                     pass
+        # Partner kanallarını da yükle (eğer sabit tanımlanmışsa)
+        if DEFAULT_PARTNER_TEXT_KANALI:
+            ayarlar = ayarlari_yukle()
+            gk = str(guild.id)
+            if gk not in ayarlar: ayarlar[gk] = {}
+            ayarlar[gk]["partner_kanal"] = DEFAULT_PARTNER_TEXT_KANALI
+            if DEFAULT_PARTNER_LOG_KANALI:
+                ayarlar[gk]["partner_log"] = DEFAULT_PARTNER_LOG_KANALI
+            ayarlari_kaydet(ayarlar)
     print("  ✅ Sabit log kanalları yüklendi.")
 
     # Varsayılan log kanallarını tüm sunuculara yükle
@@ -1235,10 +1249,10 @@ def partner_log_kanali_kaydet(guild_id: int, kanal_id: int):
     ayarlari_kaydet(ayarlar)
 
 
-def partner_log_kanali_al(guild_id: int) -> int | None:
-    """Partner log kanalı ID'sini döndürür."""
-    ayarlar = ayarlari_yukle()
-    return ayarlar.get(str(guild_id), {}).get("partner_log")
+def partner_log_kanali_al(guild_id: int):
+    """Partner log kanalı ID'sini döndürür. Settings yoksa sabit değeri kullanır."""
+    kayitli = ayarlari_yukle().get(str(guild_id), {}).get("partner_log")
+    return kayitli if kayitli else DEFAULT_PARTNER_LOG_KANALI
 
 
 def partner_istatistik_hesapla(guild_id: int) -> dict:
@@ -1304,8 +1318,14 @@ def partner_sira_bul(guild_id: int) -> int:
 # ── Partner Slash Komutları & Mesaj Kontrolü ─────────────────────
 
 def partner_kanal_id_al(guild_id: int):
-    """Partner text kanalı ID'sini döndürür."""
-    return ayarlari_yukle().get(str(guild_id), {}).get("partner_kanal")
+    """Partner text kanalı ID'sini döndürür. Settings yoksa sabit değeri kullanır."""
+    kayitli = ayarlari_yukle().get(str(guild_id), {}).get("partner_kanal")
+    return kayitli if kayitli else DEFAULT_PARTNER_TEXT_KANALI
+
+def partner_log_kanali_al_v2(guild_id: int):
+    """Partner log kanalı ID'sini döndürür. Settings yoksa sabit değeri kullanır."""
+    kayitli = ayarlari_yukle().get(str(guild_id), {}).get("partner_log")
+    return kayitli if kayitli else DEFAULT_PARTNER_LOG_KANALI
 
 def partner_kanal_id_kaydet(guild_id: int, kanal_id: int):
     """Partner text kanalını kaydeder."""
@@ -1880,52 +1900,126 @@ async def uyari_sil(ctx, uye: discord.Member):
 # ── !yardım ──────────────────────────────────────────────────────
 @bot.command(name="yardım", aliases=["yardim", "help"])
 async def yardim(ctx):
-    embed = discord.Embed(
-        title="📖 Komut Rehberi",
-        description="Botun tüm komutları aşağıda listelenmiştir.",
-        color=0x5865F2,
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.add_field(
-        name="🛡️ Moderasyon",
-        value=(
+    """.yardım — Kategorili butonlu komut menüsü."""
+
+    def ana_embed():
+        embed = discord.Embed(
+            title="📖 Komut Rehberi",
+            description=(
+                "Aşağıdaki butonlara tıklayarak kategorilere göz at.\n\n"
+                "🛡️ **Moderasyon** · 🤝 **Partner** · 🎉 **Eğlence**\n"
+                "📋 **Log** · 🔧 **Araçlar**"
+            ),
+            color=0x5865F2,
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.set_footer(text=f"{ctx.guild.name} • {zaman_damgasi()}")
+        if ctx.guild.icon:
+            embed.set_thumbnail(url=ctx.guild.icon.url)
+        return embed
+
+    def mod_embed_f():
+        embed = discord.Embed(title="🛡️ Moderasyon Komutları", color=0xE74C3C, timestamp=datetime.now(timezone.utc))
+        embed.add_field(name="Üye İşlemleri", value=(
             "`.ban @üye [sebep]` ┗ Banlar\n"
             "`.unban <id> [sebep]` ┗ Ban kaldırır\n"
             "`.kick @üye [sebep]` ┗ Atar\n"
-            "`.mute @üye [süre] [sebep]` ┗ Susturur · süre boş = kalıcı\n"
-            "`.unmute @üye` ┗ Susturmayı kaldırır\n"
+            "`.mute @üye [süre] [sebep]` ┗ Susturur · boş = kalıcı\n"
+            "`.unmute @üye` ┗ Susturmayı kaldırır"
+        ), inline=False)
+        embed.add_field(name="Kanal & Mesaj", value=(
             "`.sil [adet]` ┗ Mesaj siler (max 100)\n"
+            "`.slowmode [sn]` ┗ Yavaş mod ayarlar · 0 = kapatır\n"
+            "`.duyuru #kanal mesaj` ┗ Duyuru gönderir"
+        ), inline=False)
+        embed.add_field(name="Uyarı", value=(
             "`.warn @üye [sebep]` ┗ Uyarı verir\n"
             "`.uyarılar @üye` ┗ Uyarıları gösterir\n"
             "`.uyarısil @üye` ┗ Uyarıları temizler"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="🤝 Partner Sistemi",
-        value=(
+        ), inline=False)
+        embed.set_footer(text="◀ Ana Menü için geri dön")
+        return embed
+
+    def partner_embed_f():
+        embed = discord.Embed(title="🤝 Partner Sistemi", color=0x57F287, timestamp=datetime.now(timezone.utc))
+        embed.add_field(name="Yönetim", value=(
             "`.partner-kur #text #log` ┗ Kanalları ayarlar\n"
+            "`.partner-sifirla` ┗ Tüm kayıtları sıfırlar"
+        ), inline=False)
+        embed.add_field(name="İstatistik", value=(
             "`.partner-istatistik` ┗ Günlük/haftalık/aylık/toplam\n"
             "`.partner-top` ┗ 🥇🥈🥉 Yetkili sıralaması\n"
-            "`.partner-liste` ┗ Tüm partner sunucuları\n"
-            "`.partner-sifirla` ┗ Tüm kayıtları sıfırlar"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="📋 Log Sistemi (/slash)",
-        value=(
-            "`/log-kur` ┗ Log kanalı atar\n"
-            "`/log-kaldir` ┗ Log türünü kapatır\n"
-            "`/log-durum` ┗ Tüm log durumlarını gösterir\n"
-            "`/log-sifirla` ┗ Log ayarlarını sıfırlar"
-        ),
-        inline=False
-    )
-    embed.set_footer(text=f"{ctx.guild.name} • {zaman_damgasi()}")
-    if ctx.guild.icon:
-        embed.set_thumbnail(url=ctx.guild.icon.url)
-    await ctx.send(embed=embed)
+            "`.partner-liste` ┗ Tüm partner sunucuları"
+        ), inline=False)
+        embed.add_field(name="Nasıl Çalışır?", value=(
+            "Yetkili partner textini kanala atar\n"
+            "Bot davet linki kontrol eder · yoksa siler\n"
+            "Aynı sunucuyla 1 saat bekleme süresi var"
+        ), inline=False)
+        embed.set_footer(text="◀ Ana Menü için geri dön")
+        return embed
+
+    def eglence_embed_f():
+        embed = discord.Embed(title="🎉 Eğlence & Araçlar", color=0xF1C40F, timestamp=datetime.now(timezone.utc))
+        embed.add_field(name="Çekiliş", value=(
+            "`.çekiliş [süre] [kazanan] [ödül]` ┗ Çekiliş başlatır\n"
+            "`.çekilişbitir <mesaj_id>` ┗ Çekilişi erken bitirir"
+        ), inline=False)
+        embed.add_field(name="AFK", value=(
+            "`.afk [sebep]` ┗ AFK moduna girer\n"
+            "┗ Mesaj atınca otomatik AFK'dan çıkar\n"
+            "┗ Etiketlenince AFK olduğu bildirilir"
+        ), inline=False)
+        embed.add_field(name="Bilgi", value=(
+            "`.sunucu` ┗ Sunucu istatistiklerini gösterir"
+        ), inline=False)
+        embed.set_footer(text="◀ Ana Menü için geri dön")
+        return embed
+
+    def araclar_embed_f():
+        embed = discord.Embed(title="🔧 Araçlar & Sistemler", color=0x9B59B6, timestamp=datetime.now(timezone.utc))
+        embed.add_field(name="Ticket Sistemi", value=(
+            "`.ticket-kur [kategori] #log @rol` ┗ Sistemi kurar\n"
+            "`.ticket-panel` ┗ Ticket açma paneli gönderir"
+        ), inline=False)
+        embed.add_field(name="Anti-Link", value=(
+            "`.antilink` ┗ Durumu gösterir\n"
+            "`.antilink ac` ┗ Anti-link açar\n"
+            "`.antilink kapat` ┗ Anti-link kapatır\n"
+            "`.antilink muaf @rol` ┗ Rol muafiyeti\n"
+            "`.antilink muaf #kanal` ┗ Kanal muafiyeti"
+        ), inline=False)
+        embed.add_field(name="Log Sistemi (Slash)", value=(
+            "`/log-kur` · `/log-kaldir` · `/log-durum` · `/log-sifirla`"
+        ), inline=False)
+        embed.set_footer(text="◀ Ana Menü için geri dön")
+        return embed
+
+    class HelpView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=60)
+
+        @discord.ui.button(label="🛡️ Moderasyon", style=discord.ButtonStyle.danger)
+        async def mod(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await interaction.response.edit_message(embed=mod_embed_f(), view=self)
+
+        @discord.ui.button(label="🤝 Partner", style=discord.ButtonStyle.success)
+        async def partner(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await interaction.response.edit_message(embed=partner_embed_f(), view=self)
+
+        @discord.ui.button(label="🎉 Eğlence", style=discord.ButtonStyle.primary)
+        async def eglence(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await interaction.response.edit_message(embed=eglence_embed_f(), view=self)
+
+        @discord.ui.button(label="🔧 Araçlar", style=discord.ButtonStyle.secondary)
+        async def araclar(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await interaction.response.edit_message(embed=araclar_embed_f(), view=self)
+
+        @discord.ui.button(label="🏠 Ana Menü", style=discord.ButtonStyle.secondary, row=1)
+        async def ana(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await interaction.response.edit_message(embed=ana_embed(), view=self)
+
+    await ctx.send(embed=ana_embed(), view=HelpView())
 
 
 # ─────────────────────────────────────────
@@ -2082,7 +2176,984 @@ async def on_message(message: discord.Message):
 
             return
 
+    # ── AFK Kontrolü ─────────────────────────────────────────────
+    # Eğer mesaj atan kişi AFK'daysa AFK'dan çıkar
+    afk_veri = afk_al(message.guild.id, message.author.id) if message.guild else None
+    if afk_veri and not message.content.startswith('.afk'):
+        afk_sil(message.guild.id, message.author.id)
+        zaman = datetime.fromisoformat(afk_veri["zaman"]).replace(tzinfo=timezone.utc)
+        gecen = datetime.now(timezone.utc) - zaman
+        dk = int(gecen.total_seconds() // 60)
+        uyari = await message.channel.send(embed=discord.Embed(
+            title="👋 AFK Modundan Çıkıldı",
+            description=f"{message.author.mention} AFK modundan çıktı! ({dk} dakika AFK'daydı)",
+            color=RENKLER["giris"]
+        ))
+        await asyncio.sleep(5)
+        try: await uyari.delete()
+        except: pass
+        try:
+            if message.author.display_name.startswith("[AFK] "):
+                await message.author.edit(nick=message.author.display_name[6:])
+        except discord.Forbidden:
+            pass
+
+    # Eğer mesajda birisi etiketlendiyse ve o kişi AFK'daysa bildir
+    if message.guild and message.mentions:
+        for etiket in message.mentions:
+            afk_bilgi = afk_al(message.guild.id, etiket.id)
+            if afk_bilgi:
+                await message.channel.send(embed=discord.Embed(
+                    description=f"💤 {etiket.mention} şu an AFK — **{afk_bilgi['sebep']}**",
+                    color=RENKLER["bilgi"]
+                ), delete_after=8)
+
+    # ── Anti-Link Kontrolü ───────────────────────────────────────
+    if message.guild:
+        al_veri = antilink_durum_al(message.guild.id)
+        if al_veri.get("aktif"):
+            muaf_kanallar = al_veri.get("muaf_kanallar", [])
+            muaf_roller   = al_veri.get("muaf_roller", [])
+            yonetici      = message.author.guild_permissions.manage_messages
+
+            kanal_muaf = message.channel.id in muaf_kanallar
+            rol_muaf   = any(r.id in muaf_roller for r in message.author.roles)
+
+            if not kanal_muaf and not rol_muaf and not yonetici:
+                if LINK_REGEX.search(message.content):
+                    try:
+                        await message.delete()
+                    except discord.Forbidden:
+                        pass
+                    uyari = await message.channel.send(embed=discord.Embed(
+                        title="🔗 Link Engellendi",
+                        description=f"{message.author.mention} Bu kanalda link paylaşmak yasak!",
+                        color=RENKLER["hata"]
+                    ))
+                    await asyncio.sleep(5)
+                    try: await uyari.delete()
+                    except: pass
+                    return
+
     await bot.process_commands(message)
+
+
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SLOWMODE
+# ═══════════════════════════════════════════════════════════════
+
+@bot.command(name="slowmode", aliases=["sm", "yavasmod"])
+@commands.has_permissions(manage_channels=True)
+async def slowmode(ctx, sure: int = 0):
+    """.slowmode [saniye] — Yavaş mod ayarlar. 0 = kapalı."""
+    if sure < 0 or sure > 21600:
+        await ctx.send("❌ Süre 0-21600 saniye arasında olmalıdır."); return
+
+    await ctx.channel.edit(slowmode_delay=sure)
+
+    if sure == 0:
+        embed = discord.Embed(title="⚡ Yavaş Mod Kapatıldı", description=f"{ctx.channel.mention} kanalındaki yavaş mod kaldırıldı.", color=RENKLER["basari"])
+    else:
+        embed = discord.Embed(title="🔒 Yavaş Mod Açıldı", description=f"{ctx.channel.mention} kanalında **{sure} saniyelik** yavaş mod ayarlandı.", color=RENKLER["mute"])
+    embed.set_footer(text=f"Yetkili: {ctx.author} • {zaman_damgasi()}")
+    await ctx.send(embed=embed)
+
+
+@slowmode.error
+async def slowmode_hata(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Kanal yönetme yetkine sahip değilsin.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("📌 Kullanım: `.slowmode [saniye]`")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DUYURU
+# ═══════════════════════════════════════════════════════════════
+
+@bot.command(name="duyuru", aliases=["announce", "ilan"])
+@commands.has_permissions(manage_guild=True)
+async def duyuru(ctx, kanal: discord.TextChannel = None, *, metin: str = None):
+    """.duyuru [#kanal] <metin> — Embed duyuru gönderir."""
+    if not metin:
+        await ctx.send("📌 Kullanım: `.duyuru [#kanal] <metin>`"); return
+
+    hedef = kanal or ctx.channel
+    embed = discord.Embed(description=metin, color=0xF1C40F, timestamp=datetime.now(timezone.utc))
+    embed.set_author(name=f"📢 {ctx.guild.name} Duyurusu", icon_url=ctx.guild.icon.url if ctx.guild.icon else None)
+    embed.set_footer(text=f"Duyuran: {ctx.author}")
+    await hedef.send(embed=embed)
+
+    if hedef != ctx.channel:
+        await ctx.message.delete()
+        bilgi = await ctx.send(embed=discord.Embed(title="✅ Duyuru Gönderildi", description=f"{hedef.mention} kanalına gönderildi.", color=RENKLER["basari"]))
+        await asyncio.sleep(3)
+        await bilgi.delete()
+
+
+@duyuru.error
+async def duyuru_hata(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Sunucu yönetme yetkine sahip değilsin.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("📌 Kullanım: `.duyuru [#kanal] <metin>`")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SUNUCU İSTATİSTİK
+# ═══════════════════════════════════════════════════════════════
+
+@bot.command(name="sunucu", aliases=["serverinfo", "sinfo"])
+async def sunucu_bilgi(ctx):
+    """.sunucu — Sunucu istatistiklerini gösterir."""
+    g = ctx.guild
+    bot_sayisi   = sum(1 for m in g.members if m.bot)
+    insan_sayisi = g.member_count - bot_sayisi
+    cevrimici    = sum(1 for m in g.members if m.status != discord.Status.offline)
+
+    embed = discord.Embed(title=f"📊 {g.name}", color=0x5865F2, timestamp=datetime.now(timezone.utc))
+    if g.icon:
+        embed.set_thumbnail(url=g.icon.url)
+
+    embed.add_field(
+        name="👥 Üyeler",
+        value=f"Toplam: **{g.member_count}**\nİnsan: **{insan_sayisi}**\nBot: **{bot_sayisi}**\nÇevrimiçi: **{cevrimici}**",
+        inline=True
+    )
+    embed.add_field(
+        name="📁 Kanallar",
+        value=f"Metin: **{len(g.text_channels)}**\nSes: **{len(g.voice_channels)}**\nKategori: **{len(g.categories)}**",
+        inline=True
+    )
+    embed.add_field(
+        name="✨ Diğer",
+        value=f"Roller: **{len(g.roles)-1}**\nBoost: **{g.premium_subscription_count}** (Seviye {g.premium_tier})\nKuruluş: **{g.created_at.strftime('%d.%m.%Y')}**",
+        inline=True
+    )
+    embed.add_field(name="👑 Sahip", value=g.owner.mention if g.owner else "—", inline=True)
+    embed.add_field(name="🆔 ID", value=f"`{g.id}`", inline=True)
+    embed.set_footer(text=zaman_damgasi())
+    await ctx.send(embed=embed)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  AFK SİSTEMİ
+# ═══════════════════════════════════════════════════════════════
+
+AFK_VERI = {}  # {guild_id: {user_id: {"sebep": ..., "zaman": ...}}}
+
+@bot.command(name="afk")
+async def afk(ctx, *, sebep: str = "AFK"):
+    """.afk [sebep] — AFK modunu açar."""
+    gk = str(ctx.guild.id)
+    uk = str(ctx.author.id)
+    if gk not in AFK_VERI:
+        AFK_VERI[gk] = {}
+
+    AFK_VERI[gk][uk] = {"sebep": sebep, "zaman": datetime.now(timezone.utc).isoformat()}
+
+    embed = discord.Embed(
+        title="💤 AFK Modu Açıldı",
+        description=f"{ctx.author.mention} artık AFK.\n**Sebep:** {sebep}",
+        color=RENKLER["bilgi"]
+    )
+    embed.set_footer(text=zaman_damgasi())
+    await ctx.send(embed=embed)
+
+    try:
+        mevcut = ctx.author.display_name
+        if not mevcut.startswith("[AFK]"):
+            await ctx.author.edit(nick=f"[AFK] {mevcut}"[:32])
+    except discord.Forbidden:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ANTİ-LİNK
+# ═══════════════════════════════════════════════════════════════
+
+import re as _re
+LINK_REGEX = _re.compile(r"https?://|discord\.gg/|www\.", _re.IGNORECASE)
+ANTI_LINK_VERI = {}  # {guild_id: {"aktif": bool, "whitelist": [kanal_id]}}
+
+@bot.command(name="antilink")
+@commands.has_permissions(manage_guild=True)
+async def antilink(ctx, durum: str = "ac"):
+    """.antilink ac/kapat — Anti-link sistemini açar/kapatır."""
+    gk = str(ctx.guild.id)
+    if gk not in ANTI_LINK_VERI:
+        ANTI_LINK_VERI[gk] = {"aktif": False, "whitelist": []}
+
+    if durum.lower() in ["ac", "aç", "on"]:
+        ANTI_LINK_VERI[gk]["aktif"] = True
+        embed = discord.Embed(title="🔗 Anti-Link Açıldı", description="Yetkisiz linkler otomatik silinecek.\nYetkililer (Mesajları Yönet) link atabilir.", color=RENKLER["basari"])
+    else:
+        ANTI_LINK_VERI[gk]["aktif"] = False
+        embed = discord.Embed(title="🔗 Anti-Link Kapatıldı", description="Link kontrolü devre dışı.", color=RENKLER["hata"])
+
+    embed.set_footer(text=f"Yetkili: {ctx.author}")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="antilink-whitelist", aliases=["al-wl"])
+@commands.has_permissions(manage_guild=True)
+async def antilink_whitelist(ctx, kanal: discord.TextChannel):
+    """.antilink-whitelist #kanal — Kanalı anti-link'ten muaf tutar/çıkarır."""
+    gk = str(ctx.guild.id)
+    if gk not in ANTI_LINK_VERI:
+        ANTI_LINK_VERI[gk] = {"aktif": False, "whitelist": []}
+
+    wl = ANTI_LINK_VERI[gk]["whitelist"]
+    if kanal.id in wl:
+        wl.remove(kanal.id)
+        await ctx.send(embed=discord.Embed(title="✅ Whitelist'ten Çıkarıldı", description=f"{kanal.mention} artık kontrol edilecek.", color=RENKLER["hata"]))
+    else:
+        wl.append(kanal.id)
+        await ctx.send(embed=discord.Embed(title="✅ Whitelist'e Eklendi", description=f"{kanal.mention} artık kontrol edilmeyecek.", color=RENKLER["basari"]))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ÇEKİLİŞ SİSTEMİ
+# ═══════════════════════════════════════════════════════════════
+
+import random
+
+@bot.command(name="cekilis", aliases=["giveaway"])
+@commands.has_permissions(manage_guild=True)
+async def cekilis(ctx, sure: str = None, kazanan_sayisi: int = 1, *, odul: str = None):
+    """
+    .cekilis <süre> <kazanan_sayısı> <ödül>
+    Örn: .cekilis 1h 1 Discord Nitro
+    """
+    if not sure or not odul:
+        await ctx.send("📌 Kullanım: `.cekilis <süre> <kazanan> <ödül>`\nÖrn: `.cekilis 1h 1 Discord Nitro`"); return
+
+    birimler = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    try:
+        saniye = int(sure[:-1]) * birimler[sure[-1]]
+    except (ValueError, KeyError):
+        await ctx.send("❌ Geçersiz süre. Örn: `10s` `5m` `2h` `1d`"); return
+
+    bitis = datetime.now(timezone.utc) + discord.utils.timedelta(seconds=saniye)
+
+    embed = discord.Embed(
+        title="🎉 ÇEKİLİŞ!",
+        description=(
+            f"**Ödül:** {odul}\n"
+            f"**Katılmak için:** 🎉 emojisine tıkla\n"
+            f"**Kazanan sayısı:** {kazanan_sayisi}\n"
+            f"**Bitiş:** <t:{int(bitis.timestamp())}:R>"
+        ),
+        color=0xF1C40F,
+        timestamp=bitis
+    )
+    embed.set_footer(text=f"Düzenleyen: {ctx.author} • Bitiş")
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+
+    mesaj = await ctx.send(embed=embed)
+    await mesaj.add_reaction("🎉")
+    await ctx.message.delete()
+
+    await asyncio.sleep(saniye)
+
+    try:
+        mesaj = await ctx.channel.fetch_message(mesaj.id)
+    except discord.NotFound:
+        return
+
+    reaksiyonlar = discord.utils.get(mesaj.reactions, emoji="🎉")
+    if not reaksiyonlar:
+        await ctx.send("❌ Kimse katılmadı, çekiliş iptal edildi."); return
+
+    katilimcilar = [u async for u in reaksiyonlar.users() if not u.bot]
+    if not katilimcilar:
+        await ctx.send("❌ Geçerli katılımcı yok."); return
+
+    kazanan_sayisi = min(kazanan_sayisi, len(katilimcilar))
+    kazananlar = random.sample(katilimcilar, kazanan_sayisi)
+    kazanan_mentions = ", ".join(k.mention for k in kazananlar)
+
+    sonuc = discord.Embed(
+        title="🎊 Çekiliş Bitti!",
+        description=f"**Ödül:** {odul}\n**Kazanan(lar):** {kazanan_mentions}\nTebrikler! 🎉",
+        color=0x2ECC71,
+        timestamp=datetime.now(timezone.utc)
+    )
+    sonuc.set_footer(text=f"Düzenleyen: {ctx.author}")
+    await mesaj.edit(embed=sonuc)
+    await ctx.channel.send(f"🎉 Tebrikler {kazanan_mentions}! **{odul}** ödülünü kazandınız!")
+
+
+@bot.command(name="reroll", aliases=["cekilis-tekrar"])
+@commands.has_permissions(manage_guild=True)
+async def reroll(ctx, mesaj_id: int = None):
+    """.reroll <mesaj_id> — Çekilişi yeniden çeker."""
+    if not mesaj_id:
+        await ctx.send("📌 Kullanım: `.reroll <mesaj_id>`"); return
+    try:
+        mesaj = await ctx.channel.fetch_message(mesaj_id)
+    except discord.NotFound:
+        await ctx.send("❌ Mesaj bulunamadı."); return
+
+    reaksiyonlar = discord.utils.get(mesaj.reactions, emoji="🎉")
+    if not reaksiyonlar:
+        await ctx.send("❌ 🎉 reaksiyonu yok."); return
+
+    katilimcilar = [u async for u in reaksiyonlar.users() if not u.bot]
+    if not katilimcilar:
+        await ctx.send("❌ Katılımcı yok."); return
+
+    kazanan = random.choice(katilimcilar)
+    await ctx.send(embed=discord.Embed(title="🔄 Yeni Kazanan!", description=f"{kazanan.mention} 🎉", color=0x2ECC71))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TİCKET SİSTEMİ
+# ═══════════════════════════════════════════════════════════════
+
+TICKET_VERI = {}     # {guild_id: {"kategori": id, "log": id, "rol": id, "sayac": int}}
+ACIK_TICKETLAR = {}  # {kanal_id: user_id}
+
+class TicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎫 Ticket Aç", style=discord.ButtonStyle.primary, custom_id="ticket_ac")
+    async def ticket_ac(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gk = str(interaction.guild_id)
+        uk = str(interaction.user.id)
+
+        for kanal_id, user_id in ACIK_TICKETLAR.items():
+            if str(user_id) == uk and interaction.guild.get_channel(kanal_id):
+                await interaction.response.send_message(f"❌ Zaten açık bir ticketın var: <#{kanal_id}>", ephemeral=True)
+                return
+
+        veri = TICKET_VERI.get(gk, {})
+        kategori_id   = veri.get("kategori")
+        destek_rol_id = veri.get("rol")
+        sayac = veri.get("sayac", 0) + 1
+        if gk in TICKET_VERI:
+            TICKET_VERI[gk]["sayac"] = sayac
+
+        kategori = interaction.guild.get_channel(kategori_id) if kategori_id else None
+
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            interaction.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+        }
+        if destek_rol_id:
+            rol = interaction.guild.get_role(destek_rol_id)
+            if rol:
+                overwrites[rol] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
+        kanal = await interaction.guild.create_text_channel(
+            name=f"ticket-{sayac:04d}",
+            category=kategori,
+            overwrites=overwrites,
+            reason=f"Ticket: {interaction.user}"
+        )
+        ACIK_TICKETLAR[kanal.id] = interaction.user.id
+
+        ticket_embed = discord.Embed(
+            title="🎫 Destek Talebi",
+            description=f"Merhaba {interaction.user.mention}!\nSorununuzu buraya yazabilirsiniz.\nEkibimiz en kısa sürede yardımcı olacak.",
+            color=0x5865F2,
+            timestamp=datetime.now(timezone.utc)
+        )
+        ticket_embed.set_footer(text=f"Ticket #{sayac:04d} • {interaction.user}")
+
+        content = interaction.user.mention
+        if destek_rol_id:
+            content += f" | <@&{destek_rol_id}>"
+
+        await kanal.send(content=content, embed=ticket_embed, view=TicketKapatView())
+        await interaction.response.send_message(f"✅ Ticketın oluşturuldu: {kanal.mention}", ephemeral=True)
+
+        log_id = veri.get("log")
+        if log_id:
+            log_kanal = interaction.guild.get_channel(log_id)
+            if log_kanal:
+                await log_kanal.send(embed=discord.Embed(
+                    title="🎫 Yeni Ticket",
+                    description=f"**Kullanıcı:** {interaction.user.mention}\n**Kanal:** {kanal.mention}",
+                    color=RENKLER["bilgi"],
+                    timestamp=datetime.now(timezone.utc)
+                ))
+
+
+class TicketKapatView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔒 Kapat", style=discord.ButtonStyle.danger, custom_id="ticket_kapat")
+    async def kapat(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=discord.Embed(
+            title="🔒 Ticket Kapatılıyor",
+            description="5 saniye içinde kanal silinecek.",
+            color=RENKLER["hata"]
+        ))
+
+        gk = str(interaction.guild_id)
+        log_id = TICKET_VERI.get(gk, {}).get("log")
+        if log_id:
+            log_kanal = interaction.guild.get_channel(log_id)
+            if log_kanal:
+                user_id = ACIK_TICKETLAR.get(interaction.channel_id)
+                await log_kanal.send(embed=discord.Embed(
+                    title="🔒 Ticket Kapatıldı",
+                    description=f"**Kanal:** {interaction.channel.name}\n**Açan:** <@{user_id}>\n**Kapatan:** {interaction.user.mention}",
+                    color=RENKLER["hata"],
+                    timestamp=datetime.now(timezone.utc)
+                ))
+
+        ACIK_TICKETLAR.pop(interaction.channel_id, None)
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete()
+        except discord.NotFound:
+            pass
+
+
+@bot.command(name="ticket-kur")
+@commands.has_permissions(administrator=True)
+async def ticket_kur(ctx, kanal: discord.TextChannel, kategori: discord.CategoryChannel = None, destek_rol: discord.Role = None, log_kanal: discord.TextChannel = None):
+    """.ticket-kur #kanal [kategori] [@rol] [#log] — Ticket sistemini kurar."""
+    gk = str(ctx.guild.id)
+    TICKET_VERI[gk] = {
+        "kategori": kategori.id if kategori else None,
+        "rol":      destek_rol.id if destek_rol else None,
+        "log":      log_kanal.id if log_kanal else None,
+        "sayac":    0
+    }
+
+    embed = discord.Embed(
+        title="🎫 Destek Sistemi",
+        description="Herhangi bir konuda yardıma mı ihtiyacın var?\nAşağıdaki butona tıklayarak ticket açabilirsin.",
+        color=0x5865F2
+    )
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+    embed.set_footer(text=ctx.guild.name)
+
+    await kanal.send(embed=embed, view=TicketView())
+    await ctx.send(embed=discord.Embed(
+        title="✅ Ticket Sistemi Kuruldu",
+        description=f"Ticket butonu {kanal.mention} kanalına gönderildi.",
+        color=RENKLER["basari"]
+    ))
+
+
+
+yeni_kod = '''
+# ═══════════════════════════════════════════════════════════════
+#  SLOWMODE
+# ═══════════════════════════════════════════════════════════════
+
+@bot.command(name="slowmode", aliases=["yavaşmod", "sm"])
+@commands.has_permissions(manage_channels=True)
+async def slowmode(ctx, sure: int = 0):
+    """
+    .slowmode [saniye] — Kanalda yavaş mod ayarlar.
+    0 yazarsan yavaş modu kapatır.
+    """
+    if sure < 0 or sure > 21600:
+        await ctx.send("❌ Süre 0-21600 saniye arasında olmalı."); return
+
+    await ctx.channel.edit(slowmode_delay=sure)
+
+    if sure == 0:
+        embed = discord.Embed(title="✅ Yavaş Mod Kapatıldı", color=RENKLER["basari"])
+        embed.add_field(name="📍 Kanal", value=ctx.channel.mention, inline=True)
+    else:
+        embed = discord.Embed(title="🐢 Yavaş Mod Açıldı", color=RENKLER["mute"])
+        embed.add_field(name="📍 Kanal", value=ctx.channel.mention, inline=True)
+        embed.add_field(name="⏱️ Süre", value=f"{sure} saniye", inline=True)
+
+    embed.add_field(name="🛡️ Yetkili", value=ctx.author.mention, inline=True)
+    embed.set_footer(text=zaman_damgasi())
+    await ctx.send(embed=embed)
+
+
+@slowmode.error
+async def slowmode_hata(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Kanal yönetme yetkine sahip değilsin.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("📌 Kullanım: `.slowmode [saniye]`")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DUYURU KOMUTU
+# ═══════════════════════════════════════════════════════════════
+
+@bot.command(name="duyuru", aliases=["announce", "ann"])
+@commands.has_permissions(manage_guild=True)
+async def duyuru(ctx, kanal: discord.TextChannel = None, *, mesaj: str = None):
+    """
+    .duyuru #kanal [mesaj] — Belirtilen kanala duyuru gönderir.
+    Kanal belirtilmezse mevcut kanala gönderir.
+    """
+    if not mesaj:
+        await ctx.send("📌 Kullanım: `.duyuru #kanal mesajınız`"); return
+
+    hedef = kanal or ctx.channel
+
+    embed = discord.Embed(
+        description=mesaj,
+        color=0xE74C3C,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_author(name=f"📢 {ctx.guild.name} Duyurusu", icon_url=ctx.guild.icon.url if ctx.guild.icon else None)
+    embed.set_footer(text=f"Duyuran: {ctx.author}")
+
+    await hedef.send("@everyone", embed=embed)
+    await ctx.message.delete()
+
+
+@duyuru.error
+async def duyuru_hata(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Sunucu yönetme yetkine sahip değilsin.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("📌 Kullanım: `.duyuru #kanal mesajınız`")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SUNUCU İSTATİSTİK
+# ═══════════════════════════════════════════════════════════════
+
+@bot.command(name="sunucu", aliases=["server", "serverinfo", "si"])
+async def sunucu_bilgi(ctx):
+    """.sunucu — Sunucu istatistiklerini gösterir."""
+    guild = ctx.guild
+
+    toplam_uye    = guild.member_count
+    bot_sayisi    = sum(1 for m in guild.members if m.bot)
+    insan_sayisi  = toplam_uye - bot_sayisi
+    text_kanal    = len(guild.text_channels)
+    ses_kanal     = len(guild.voice_channels)
+    rol_sayisi    = len(guild.roles) - 1  # @everyone hariç
+    boost_sayisi  = guild.premium_subscription_count
+    boost_seviye  = guild.premium_tier
+
+    embed = discord.Embed(
+        title=f"📊 {guild.name}",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc)
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    embed.add_field(name="👑 Sahip",       value=guild.owner.mention,             inline=True)
+    embed.add_field(name="🆔 Sunucu ID",   value=f"`{guild.id}`",                 inline=True)
+    embed.add_field(name="📅 Kuruluş",     value=guild.created_at.strftime("%d.%m.%Y"), inline=True)
+
+    embed.add_field(name="👥 Toplam Üye",  value=str(toplam_uye),                 inline=True)
+    embed.add_field(name="🧑 İnsan",       value=str(insan_sayisi),               inline=True)
+    embed.add_field(name="🤖 Bot",         value=str(bot_sayisi),                 inline=True)
+
+    embed.add_field(name="💬 Metin Kanal", value=str(text_kanal),                 inline=True)
+    embed.add_field(name="🔊 Ses Kanal",   value=str(ses_kanal),                  inline=True)
+    embed.add_field(name="🎭 Rol",         value=str(rol_sayisi),                 inline=True)
+
+    embed.add_field(name="🚀 Boost",       value=f"{boost_sayisi} boost · Seviye {boost_seviye}", inline=True)
+
+    embed.set_footer(text=zaman_damgasi())
+    await ctx.send(embed=embed)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  AFK SİSTEMİ
+# ═══════════════════════════════════════════════════════════════
+# Veri: settings.json → guild_id → "afk" → { user_id: {"sebep": ..., "zaman": ...} }
+
+def afk_kaydet(guild_id: int, user_id: int, sebep: str):
+    ayarlar = ayarlari_yukle()
+    gk = str(guild_id)
+    uk = str(user_id)
+    if gk not in ayarlar: ayarlar[gk] = {}
+    if "afk" not in ayarlar[gk]: ayarlar[gk]["afk"] = {}
+    ayarlar[gk]["afk"][uk] = {
+        "sebep": sebep,
+        "zaman": datetime.now(timezone.utc).isoformat()
+    }
+    ayarlari_kaydet(ayarlar)
+
+def afk_sil(guild_id: int, user_id: int):
+    ayarlar = ayarlari_yukle()
+    gk = str(guild_id)
+    uk = str(user_id)
+    if gk in ayarlar and "afk" in ayarlar[gk] and uk in ayarlar[gk]["afk"]:
+        del ayarlar[gk]["afk"][uk]
+        ayarlari_kaydet(ayarlar)
+
+def afk_al(guild_id: int, user_id: int):
+    return ayarlari_yukle().get(str(guild_id), {}).get("afk", {}).get(str(user_id))
+
+
+@bot.command(name="afk")
+async def afk(ctx, *, sebep: str = "AFK"):
+    """.afk [sebep] — AFK moduna girer."""
+    afk_kaydet(ctx.guild.id, ctx.author.id, sebep)
+    embed = discord.Embed(
+        title="😴 AFK Moduna Geçildi",
+        description=f"{ctx.author.mention} AFK moduna geçti.\n**Sebep:** {sebep}",
+        color=RENKLER["bilgi"]
+    )
+    embed.set_footer(text=zaman_damgasi())
+    await ctx.send(embed=embed)
+    try:
+        await ctx.author.edit(nick=f"[AFK] {ctx.author.display_name}"[:32])
+    except discord.Forbidden:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ÇEKİLİŞ SİSTEMİ
+# ═══════════════════════════════════════════════════════════════
+
+import random
+
+@bot.command(name="çekiliş", aliases=["cekilisbaslat", "gstart", "giveaway"])
+@commands.has_permissions(manage_guild=True)
+async def cekilisbaslat(ctx, sure: str = None, kazanan: int = 1, *, odul: str = None):
+    """
+    .çekiliş [süre] [kazanan_sayısı] [ödül]
+    Süre: 10s, 5m, 2h, 1d
+    Örnek: .çekiliş 1h 2 Nitro
+    """
+    if not sure or not odul:
+        await ctx.send("📌 Kullanım: `.çekiliş [süre] [kazanan sayısı] [ödül]`\nÖrnek: `.çekiliş 1h 1 Nitro`")
+        return
+
+    birimler = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    try:
+        saniye = int(sure[:-1]) * birimler[sure[-1]]
+    except (ValueError, KeyError, IndexError):
+        await ctx.send("❌ Geçersiz süre. Örnek: `10s`, `5m`, `2h`, `1d`"); return
+
+    bitis = datetime.now(timezone.utc) + discord.utils.timedelta(seconds=saniye)
+
+    embed = discord.Embed(
+        title=f"🎉 ÇEKİLİŞ — {odul}",
+        description=(
+            f"Katılmak için 🎉 tepkisini ver!\n\n"
+            f"**⏰ Bitiş:** {bitis.strftime('%d.%m.%Y %H:%M UTC')}\n"
+            f"**🏆 Kazanan:** {kazanan} kişi\n"
+            f"**🎁 Ödül:** {odul}"
+        ),
+        color=0xFF73FA,
+        timestamp=bitis
+    )
+    embed.set_footer(text=f"Bitiş")
+    embed.set_author(name=ctx.author.display_name, icon_url=ctx.author.display_avatar.url)
+
+    mesaj = await ctx.send(embed=embed)
+    await mesaj.add_reaction("🎉")
+    await ctx.message.delete()
+
+    # Süre bekle
+    await asyncio.sleep(saniye)
+
+    # Mesajı yeniden al (tepkileri güncelle)
+    try:
+        mesaj = await ctx.channel.fetch_message(mesaj.id)
+    except discord.NotFound:
+        return
+
+    # Katılımcıları topla
+    tepki = discord.utils.get(mesaj.reactions, emoji="🎉")
+    if not tepki:
+        await ctx.send("❌ Kimse katılmadı, çekiliş iptal.")
+        return
+
+    katilimcilar = [u async for u in tepki.users() if not u.bot]
+
+    if not katilimcilar:
+        await ctx.send("❌ Geçerli katılımcı yok, çekiliş iptal.")
+        return
+
+    kazananlar = random.sample(katilimcilar, min(kazanan, len(katilimcilar)))
+    kazanan_str = " ".join(u.mention for u in kazananlar)
+
+    bitis_embed = discord.Embed(
+        title=f"🎊 ÇEKİLİŞ SONA ERDİ — {odul}",
+        description=(
+            f"**🏆 Kazanan(lar):** {kazanan_str}\n"
+            f"**🎁 Ödül:** {odul}\n"
+            f"**👥 Katılımcı:** {len(katilimcilar)} kişi"
+        ),
+        color=0xFF73FA,
+        timestamp=datetime.now(timezone.utc)
+    )
+    bitis_embed.set_footer(text=zaman_damgasi())
+    await mesaj.edit(embed=bitis_embed)
+    await ctx.channel.send(f"🎉 Tebrikler {kazanan_str}! **{odul}** kazandınız!")
+
+
+@bot.command(name="çekilişbitir", aliases=["gend", "giveawayend"])
+@commands.has_permissions(manage_guild=True)
+async def cekilisbitir(ctx, mesaj_id: int = None):
+    """.çekilişbitir [mesaj_id] — Çekilişi erken bitirir ve kazananı seçer."""
+    if not mesaj_id:
+        await ctx.send("📌 Kullanım: `.çekilişbitir <mesaj_id>`"); return
+
+    try:
+        mesaj = await ctx.channel.fetch_message(mesaj_id)
+    except discord.NotFound:
+        await ctx.send("❌ Mesaj bulunamadı."); return
+
+    tepki = discord.utils.get(mesaj.reactions, emoji="🎉")
+    if not tepki:
+        await ctx.send("❌ Bu mesajda 🎉 tepkisi yok."); return
+
+    katilimcilar = [u async for u in tepki.users() if not u.bot]
+    if not katilimcilar:
+        await ctx.send("❌ Katılımcı yok."); return
+
+    kazanan = random.choice(katilimcilar)
+    await ctx.send(f"🎉 Yeni kazanan: {kazanan.mention}!")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TİCKET SİSTEMİ
+# ═══════════════════════════════════════════════════════════════
+# Ayarlar: settings.json → guild_id → "ticket" → { "kategori": id, "log": id, "rol": id }
+
+def ticket_ayar_al(guild_id: int) -> dict:
+    return ayarlari_yukle().get(str(guild_id), {}).get("ticket", {})
+
+def ticket_ayar_kaydet(guild_id: int, veri: dict):
+    ayarlar = ayarlari_yukle()
+    gk = str(guild_id)
+    if gk not in ayarlar: ayarlar[gk] = {}
+    ayarlar[gk]["ticket"] = veri
+    ayarlari_kaydet(ayarlar)
+
+
+@bot.command(name="ticket-kur", aliases=["ticketkur"])
+@commands.has_permissions(administrator=True)
+async def ticket_kur(ctx, kategori: discord.CategoryChannel = None, log: discord.TextChannel = None, destek_rolu: discord.Role = None):
+    """
+    .ticket-kur #kategori #log-kanal @destek-rolü
+    Ticket sistemini kurar.
+    """
+    if not kategori or not log or not destek_rolu:
+        await ctx.send("📌 Kullanım: `.ticket-kur [kategori] #log-kanal @destek-rolü`"); return
+
+    ticket_ayar_kaydet(ctx.guild.id, {
+        "kategori": kategori.id,
+        "log":      log.id,
+        "rol":      destek_rolu.id
+    })
+
+    embed = discord.Embed(title="✅ Ticket Sistemi Kuruldu", color=RENKLER["basari"])
+    embed.add_field(name="📁 Kategori",    value=kategori.name,      inline=True)
+    embed.add_field(name="📋 Log Kanalı", value=log.mention,          inline=True)
+    embed.add_field(name="🛡️ Destek Rolü", value=destek_rolu.mention, inline=True)
+    embed.set_footer(text=zaman_damgasi())
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="ticket-panel", aliases=["ticketpanel"])
+@commands.has_permissions(administrator=True)
+async def ticket_panel(ctx):
+    """.ticket-panel — Ticket açma paneli gönderir."""
+    ayar = ticket_ayar_al(ctx.guild.id)
+    if not ayar:
+        await ctx.send("❌ Önce `.ticket-kur` ile sistemi kur."); return
+
+    class TicketView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=None)
+
+        @discord.ui.button(label="🎫 Ticket Aç", style=discord.ButtonStyle.primary, custom_id="ticket_ac")
+        async def ticket_ac(self, interaction: discord.Interaction, button: discord.ui.Button):
+            ayar = ticket_ayar_al(interaction.guild_id)
+            if not ayar:
+                await interaction.response.send_message("❌ Ticket sistemi kurulmamış.", ephemeral=True); return
+
+            kategori = interaction.guild.get_channel(ayar["kategori"])
+            destek_rolu = interaction.guild.get_role(ayar["rol"])
+
+            if not kategori:
+                await interaction.response.send_message("❌ Kategori bulunamadı.", ephemeral=True); return
+
+            # Zaten açık ticket var mı?
+            mevcut = discord.utils.get(
+                interaction.guild.text_channels,
+                name=f"ticket-{interaction.user.name.lower().replace(' ', '-')}"
+            )
+            if mevcut:
+                await interaction.response.send_message(f"❌ Zaten açık bir ticketın var: {mevcut.mention}", ephemeral=True); return
+
+            # Kanal oluştur
+            overwrites = {
+                interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            }
+            if destek_rolu:
+                overwrites[destek_rolu] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+
+            kanal = await kategori.create_text_channel(
+                name=f"ticket-{interaction.user.name.lower()[:20]}",
+                overwrites=overwrites,
+                topic=f"Ticket sahibi: {interaction.user} ({interaction.user.id})"
+            )
+
+            # Ticket kanalına hoş geldin mesajı
+            class KapatView(discord.ui.View):
+                def __init__(self):
+                    super().__init__(timeout=None)
+
+                @discord.ui.button(label="🔒 Ticketı Kapat", style=discord.ButtonStyle.danger, custom_id="ticket_kapat")
+                async def kapat(self, i2: discord.Interaction, b2: discord.ui.Button):
+                    await i2.response.send_message("Ticket kapatılıyor...", ephemeral=True)
+                    await kanal.delete(reason=f"{i2.user} tarafından kapatıldı")
+
+                    # Log
+                    log_id = ayar.get("log")
+                    if log_id:
+                        log_kanal = i2.guild.get_channel(log_id)
+                        if log_kanal:
+                            await log_kanal.send(embed=discord.Embed(
+                                title="🔒 Ticket Kapatıldı",
+                                description=(
+                                    f"**Ticket:** {kanal.name}\n"
+                                    f"**Kapatan:** {i2.user.mention}\n"
+                                    f"**Sahip:** {interaction.user.mention}"
+                                ),
+                                color=RENKLER["hata"],
+                                timestamp=datetime.now(timezone.utc)
+                            ))
+
+            ac_embed = discord.Embed(
+                title="🎫 Ticket Açıldı",
+                description=f"Merhaba {interaction.user.mention}!\nDestek ekibimiz en kısa sürede yardımcı olacak.\n\nTicketı kapatmak için aşağıdaki butonu kullan.",
+                color=0x57F287,
+                timestamp=datetime.now(timezone.utc)
+            )
+            ac_embed.set_footer(text=zaman_damgasi())
+            await kanal.send(
+                content=f"{interaction.user.mention} {destek_rolu.mention if destek_rolu else ''}",
+                embed=ac_embed,
+                view=KapatView()
+            )
+
+            await interaction.response.send_message(f"✅ Ticketın açıldı: {kanal.mention}", ephemeral=True)
+
+            # Log
+            log_id = ayar.get("log")
+            if log_id:
+                log_kanal = interaction.guild.get_channel(log_id)
+                if log_kanal:
+                    await log_kanal.send(embed=discord.Embed(
+                        title="🎫 Yeni Ticket Açıldı",
+                        description=f"**Açan:** {interaction.user.mention}\n**Kanal:** {kanal.mention}",
+                        color=RENKLER["giris"],
+                        timestamp=datetime.now(timezone.utc)
+                    ))
+
+    embed = discord.Embed(
+        title="🎫 Destek Merkezi",
+        description="Yardım almak için aşağıdaki butona tıkla.",
+        color=0x5865F2
+    )
+    embed.set_footer(text=ctx.guild.name)
+    await ctx.send(embed=embed, view=TicketView())
+    await ctx.message.delete()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ANTİ-LİNK
+# ═══════════════════════════════════════════════════════════════
+# Muaf kanallar ve roller settings.json'da tutulur.
+# Komutlar: .antilink aç/kapat, .antilink muaf @rol, .antilink muaf #kanal
+
+LINK_REGEX = re.compile(r'https?://\S+|discord\.gg/\S+|www\.\S+')
+
+def antilink_durum_al(guild_id: int) -> dict:
+    return ayarlari_yukle().get(str(guild_id), {}).get("antilink", {"aktif": False, "muaf_roller": [], "muaf_kanallar": []})
+
+def antilink_kaydet(guild_id: int, veri: dict):
+    ayarlar = ayarlari_yukle()
+    gk = str(guild_id)
+    if gk not in ayarlar: ayarlar[gk] = {}
+    ayarlar[gk]["antilink"] = veri
+    ayarlari_kaydet(ayarlar)
+
+
+@bot.group(name="antilink", invoke_without_command=True)
+@commands.has_permissions(manage_guild=True)
+async def antilink(ctx):
+    """.antilink — Anti-link durumunu gösterir."""
+    veri = antilink_durum_al(ctx.guild.id)
+    durum = "✅ Aktif" if veri["aktif"] else "❌ Deaktif"
+    embed = discord.Embed(title="🔗 Anti-Link Sistemi", color=RENKLER["bilgi"])
+    embed.add_field(name="Durum", value=durum, inline=True)
+    embed.add_field(name="Muaf Roller", value=str(len(veri.get("muaf_roller", []))) + " rol", inline=True)
+    embed.add_field(name="Muaf Kanallar", value=str(len(veri.get("muaf_kanallar", []))) + " kanal", inline=True)
+    await ctx.send(embed=embed)
+
+
+@antilink.command(name="ac", aliases=["aç"])
+@commands.has_permissions(manage_guild=True)
+async def antilink_ac(ctx):
+    veri = antilink_durum_al(ctx.guild.id)
+    veri["aktif"] = True
+    antilink_kaydet(ctx.guild.id, veri)
+    await ctx.send(embed=discord.Embed(title="✅ Anti-Link Açıldı", color=RENKLER["basari"],
+        description="Artık izinsiz link paylaşanların mesajları silinecek."))
+
+
+@antilink.command(name="kapat")
+@commands.has_permissions(manage_guild=True)
+async def antilink_kapat(ctx):
+    veri = antilink_durum_al(ctx.guild.id)
+    veri["aktif"] = False
+    antilink_kaydet(ctx.guild.id, veri)
+    await ctx.send(embed=discord.Embed(title="❌ Anti-Link Kapatıldı", color=RENKLER["hata"]))
+
+
+@antilink.command(name="muaf")
+@commands.has_permissions(manage_guild=True)
+async def antilink_muaf(ctx, hedef: discord.Role | discord.TextChannel = None):
+    """.antilink muaf @rol veya .antilink muaf #kanal"""
+    if not hedef:
+        await ctx.send("📌 `.antilink muaf @rol` veya `.antilink muaf #kanal`"); return
+
+    veri = antilink_durum_al(ctx.guild.id)
+
+    if isinstance(hedef, discord.Role):
+        liste = veri.setdefault("muaf_roller", [])
+        if hedef.id in liste:
+            liste.remove(hedef.id)
+            mesaj = f"{hedef.mention} muafiyet listesinden çıkarıldı."
+        else:
+            liste.append(hedef.id)
+            mesaj = f"{hedef.mention} muafiyet listesine eklendi."
+    else:
+        liste = veri.setdefault("muaf_kanallar", [])
+        if hedef.id in liste:
+            liste.remove(hedef.id)
+            mesaj = f"{hedef.mention} muafiyet listesinden çıkarıldı."
+        else:
+            liste.append(hedef.id)
+            mesaj = f"{hedef.mention} muafiyet listesine eklendi."
+
+    antilink_kaydet(ctx.guild.id, veri)
+    await ctx.send(embed=discord.Embed(description=mesaj, color=RENKLER["basari"]))
+
+'''
+
+with open('/tmp/yeni_ozellikler.py', 'w', encoding='utf-8') as f:
+    f.write(yeni_kod)
+print('Done')
+
 
 # ─────────────────────────────────────────
 #  FLASK (RENDER CANLI TUTMAK İÇİN)
