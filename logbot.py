@@ -38,6 +38,36 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable ayarlanmamis! Render'da Environment sekmesine ekle.")
 AYAR_DOSYASI = "settings.json"      # Kanal ID'leri burada saklanır
 
+# ─────────────────────────────────────────
+#  SABİT LOG KANALLARI (deploy'dan etkilenmez)
+#  Kod güncellendiğinde settings.json silinse bile
+#  bu ID'ler otomatik olarak yeniden yüklenir.
+# ─────────────────────────────────────────
+DEFAULT_LOG_KANALLARI = {
+    "ban_log":     1484564146111647917,
+    "mute_log":    1484564329549267104,
+    "mod_log":     1484564481257508874,
+    "rol_log":     1484564569446944949,
+    "mesaj_log":   1484564647704137879,
+    "kanal_log":   1484565700969496606,
+    "ses_log":     1484564774648938496,
+    "davet_log":   1484564912486355106,
+}
+
+# ── Sabit Log Kanalları ──────────────────────────────────────────
+# Bu kanallar her deploy sonrası otomatik yüklenir.
+# Değiştirmek istersen buradan düzenle.
+VARSAYILAN_LOG_KANALLARI = {
+    "ban_log":     1484564146111647917,
+    "mute_log":    1484564329549267104,
+    "mod_log":     1484564481257508874,
+    "rol_log":     1484564569446944949,
+    "mesaj_log":   1484564647704137879,
+    "kanal_log":   1484565700969496606,
+    "ses_log":     1484564774648938496,
+    "davet_log":   1484564912486355106,
+}
+
 # Desteklenen log türleri ve açıklamaları
 LOG_TURLERI = {
     "ban_log":      "🔨 Ban / Unban logları",
@@ -81,6 +111,25 @@ def ayarlari_yukle() -> dict:
         return {}
     with open(AYAR_DOSYASI, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def varsayilan_kanallari_yukle(guild_id: int):
+    """
+    Varsayılan log kanallarını settings.json'a yazar.
+    Her bot başlangıcında çağrılır — mevcut ayarların üzerine yazmaz,
+    sadece eksik olanları tamamlar.
+    """
+    ayarlar = ayarlari_yukle()
+    gk = str(guild_id)
+    if gk not in ayarlar:
+        ayarlar[gk] = {}
+    degisti = False
+    for tur, kanal_id in VARSAYILAN_LOG_KANALLARI.items():
+        if tur not in ayarlar[gk]:
+            ayarlar[gk][tur] = kanal_id
+            degisti = True
+    if degisti:
+        ayarlari_kaydet(ayarlar)
 
 
 def ayarlari_kaydet(veri: dict):
@@ -1066,6 +1115,53 @@ async def on_ready():
         print(f"  ✅ {len(synced)} slash komutu senkronize edildi.")
     except Exception as e:
         print(f"  ❌ Komut senkronizasyonu başarısız: {e}")
+
+    # ── Sabit log kanallarını settings.json'a yükle ──────────
+    # Her bot başladığında DEFAULT_LOG_KANALLARI settings.json'a yazılır.
+    # Böylece deploy sonrası settings.json silinse bile kanallar kaybolmaz.
+    for guild in bot.guilds:
+        ayarlar = ayarlari_yukle()
+        gk = str(guild.id)
+        if gk not in ayarlar:
+            ayarlar[gk] = {}
+        for tur, kanal_id in DEFAULT_LOG_KANALLARI.items():
+            ayarlar[gk][tur] = kanal_id
+        ayarlari_kaydet(ayarlar)
+
+        # Her kanala "sistem aktif" mesajı gönder
+        for tur, kanal_id in DEFAULT_LOG_KANALLARI.items():
+            kanal = guild.get_channel(kanal_id)
+            if kanal:
+                try:
+                    await kanal.send(embed=discord.Embed(
+                        title="✅ Log Sistemi Yeniden Başlatıldı",
+                        description=f"Bot yeniden başlatıldı. **{LOG_TURLERI.get(tur, tur)}** aktif.",
+                        color=RENKLER["basari"]
+                    ))
+                except Exception:
+                    pass
+    print("  ✅ Sabit log kanalları yüklendi.")
+
+    # Varsayılan log kanallarını tüm sunuculara yükle
+    for guild in bot.guilds:
+        varsayilan_kanallari_yukle(guild.id)
+        print(f"  ✅ {guild.name} için varsayılan kanallar yüklendi.")
+
+    # Mod log kanalına yeniden başlatma bildirimi gönder
+    for guild in bot.guilds:
+        mod_kanal_id = VARSAYILAN_LOG_KANALLARI.get("mod_log")
+        if mod_kanal_id:
+            kanal = guild.get_channel(mod_kanal_id)
+            if kanal:
+                try:
+                    await kanal.send(embed=discord.Embed(
+                        title="🟢 Bot Yeniden Başlatıldı",
+                        description="Bot yeniden başlatıldı, tüm log kanalları otomatik yüklendi.",
+                        color=RENKLER["basari"],
+                        timestamp=datetime.now(timezone.utc)
+                    ))
+                except Exception:
+                    pass
 
     print("━" * 52)
     print(f"  🤖 Bot    : {bot.user} ({bot.user.id})")
