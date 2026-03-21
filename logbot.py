@@ -1248,30 +1248,30 @@ def yetkili_siralamasi_al(guild_id: int) -> list:
     return liste
 
 
-@bot.tree.command(name="partner-kur", description="Partner kanallarını ayarlar")
-@app_commands.describe(
-    text_kanal="Yetkililerin partner textini atacağı kanal",
-    log_kanal="Partner loglarının gönderileceği kanal"
-)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def partner_kur(
-    interaction: discord.Interaction,
-    text_kanal: discord.TextChannel,
-    log_kanal: discord.TextChannel
-):
-    """İki kanalı ayarlar: partner text kanalı ve log kanalı."""
-    partner_kanal_id_kaydet(interaction.guild_id, text_kanal.id)
-    partner_log_kanali_kaydet(interaction.guild_id, log_kanal.id)
+# ── Partner Prefix Komutları ─────────────────────────────────────
+
+@bot.command(name="partner-kur")
+@commands.has_permissions(manage_guild=True)
+async def partner_kur(ctx, text_kanal: discord.TextChannel = None, log_kanal: discord.TextChannel = None):
+    """
+    .partner-kur #text-kanal #log-kanal
+    Partner text ve log kanallarını ayarlar.
+    """
+    if not text_kanal or not log_kanal:
+        await ctx.send("📌 Kullanım: `.partner-kur #text-kanal #log-kanal`")
+        return
+
+    partner_kanal_id_kaydet(ctx.guild.id, text_kanal.id)
+    partner_log_kanali_kaydet(ctx.guild.id, log_kanal.id)
 
     embed = discord.Embed(title="✅ Partner Kanalları Ayarlandı", color=RENKLER["basari"], timestamp=datetime.now(timezone.utc))
     embed.add_field(name="📢 Partner Text", value=text_kanal.mention, inline=True)
     embed.add_field(name="📋 Partner Log",  value=log_kanal.mention,  inline=True)
-    embed.set_footer(text=f"Ayarlayan: {interaction.user}")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
+    embed.set_footer(text=f"Ayarlayan: {ctx.author}")
+    await ctx.send(embed=embed)
     await text_kanal.send(embed=discord.Embed(
         title="🤝 Partner Kanalı Aktif",
-        description="Yetkililerin partner textini atacağı kanal olarak ayarlandı.\nDavet linki içermeyen mesajlar otomatik silinecek.",
+        description="Bu kanal partner text kanalı olarak ayarlandı.\nDavet linki içermeyen mesajlar otomatik silinecek.",
         color=RENKLER["basari"]
     ))
     await log_kanal.send(embed=discord.Embed(
@@ -1281,16 +1281,16 @@ async def partner_kur(
     ))
 
 
-@bot.tree.command(name="partner-istatistik", description="Sunucunun partner istatistiklerini gösterir")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def partner_istatistik(interaction: discord.Interaction):
-    """Günlük/haftalık/aylık/toplam istatistik + sıralama gösterir."""
-    stats = partner_istatistik_hesapla(interaction.guild_id)
-    sira  = partner_sira_bul(interaction.guild_id)
+@bot.command(name="partner-istatistik", aliases=["p-istat", "pistat"])
+@commands.has_permissions(manage_guild=True)
+async def partner_istatistik(ctx):
+    """.partner-istatistik — Sunucunun partner istatistiklerini gösterir."""
+    stats = partner_istatistik_hesapla(ctx.guild.id)
+    sira  = partner_sira_bul(ctx.guild.id)
 
     embed = discord.Embed(
         title="📊 Partner İstatistikleri",
-        description=f"**{interaction.guild.name}** sunucusunun partner verileri",
+        description=f"**{ctx.guild.name}** sunucusunun partner verileri",
         color=0x57F287,
         timestamp=datetime.now(timezone.utc)
     )
@@ -1305,30 +1305,27 @@ async def partner_istatistik(interaction: discord.Interaction):
         inline=True
     )
     embed.add_field(name="• Toplam", value=f"**{stats['toplam']}**", inline=True)
-    embed.set_footer(text=f"{bot.user.name} • Partner Sistemi • {zaman_damgasi()}")
-    await interaction.response.send_message(embed=embed)
+    embed.set_footer(text=f"{ctx.bot.user.name} • Partner Sistemi • {zaman_damgasi()}")
+    await ctx.send(embed=embed)
 
 
-@bot.tree.command(name="partner-top", description="Yetkililerin partner sıralamasını gösterir")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def partner_top(interaction: discord.Interaction):
-    """
-    Yetkililerin yaptığı toplam partnerlik sayısına göre sıralama tablosu.
-    Kim kaç partnerlik yapmış gösterir.
-    """
-    sıralama = yetkili_siralamasi_al(interaction.guild_id)
+@bot.command(name="partner-top", aliases=["p-top", "ptop"])
+@commands.has_permissions(manage_guild=True)
+async def partner_top(ctx):
+    """.partner-top — Yetkililerin partner sıralamasını gösterir."""
+    sıralama = yetkili_siralamasi_al(ctx.guild.id)
 
     if not sıralama:
-        await interaction.response.send_message(embed=discord.Embed(
+        await ctx.send(embed=discord.Embed(
             title="📋 Partner Sıralaması",
             description="Henüz hiç partnerlik kaydı yok.",
             color=RENKLER["bilgi"]
-        ), ephemeral=True)
+        ))
         return
 
     madalyalar = ["🥇", "🥈", "🥉"]
     satirlar = []
-    for i, yetkili in enumerate(sıralama[:20], 1):  # max 20 kişi
+    for i, yetkili in enumerate(sıralama[:20], 1):
         madalya = madalyalar[i-1] if i <= 3 else f"`{i}.`"
         satirlar.append(f"{madalya} <@{yetkili['id']}> — **{yetkili['sayi']}** partnerlik")
 
@@ -1339,20 +1336,20 @@ async def partner_top(interaction: discord.Interaction):
         timestamp=datetime.now(timezone.utc)
     )
     embed.set_footer(text=f"Toplam {len(sıralama)} yetkili • {zaman_damgasi()}")
-    await interaction.response.send_message(embed=embed)
+    await ctx.send(embed=embed)
 
 
-@bot.tree.command(name="partner-liste", description="Tüm partner sunucularını listeler")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def partner_liste(interaction: discord.Interaction):
-    """Tüm partner kayıtlarını listeler."""
-    partners = partner_verisi_al(interaction.guild_id)
+@bot.command(name="partner-liste", aliases=["p-liste", "pliste"])
+@commands.has_permissions(manage_guild=True)
+async def partner_liste(ctx):
+    """.partner-liste — Tüm partner sunucularını listeler."""
+    partners = partner_verisi_al(ctx.guild.id)
     if not partners:
-        await interaction.response.send_message(embed=discord.Embed(
+        await ctx.send(embed=discord.Embed(
             title="📋 Partner Listesi",
             description="Henüz hiç partner kaydı yok.",
             color=RENKLER["bilgi"]
-        ), ephemeral=True)
+        ))
         return
 
     satirlar = []
@@ -1363,216 +1360,77 @@ async def partner_liste(interaction: discord.Interaction):
             zaman = "—"
         satirlar.append(f"`{i}.` **{p['guild_name']}** — {zaman} — <@{p['yapan_id']}>")
 
+    # Sayfalama — her sayfada 10 partner
     sayfalar = [satirlar[i:i+10] for i in range(0, len(satirlar), 10)]
-    embed = discord.Embed(
-        title=f"📋 Partner Listesi — Toplam {len(partners)}",
-        description="\n".join(sayfalar[0]),
-        color=0x57F287,
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.set_footer(text=f"Sayfa 1/{len(sayfalar)} • {zaman_damgasi()}" if len(sayfalar) > 1 else zaman_damgasi())
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    class SayfaView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=60)
+            self.sayfa = 0
+
+        def embed_olustur(self):
+            e = discord.Embed(
+                title=f"📋 Partner Listesi — Toplam {len(partners)}",
+                description="\n".join(sayfalar[self.sayfa]),
+                color=0x57F287,
+                timestamp=datetime.now(timezone.utc)
+            )
+            e.set_footer(text=f"Sayfa {self.sayfa+1}/{len(sayfalar)} • {zaman_damgasi()}")
+            return e
+
+        @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+        async def geri(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if self.sayfa > 0:
+                self.sayfa -= 1
+            await interaction.response.edit_message(embed=self.embed_olustur(), view=self)
+
+        @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+        async def ileri(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if self.sayfa < len(sayfalar) - 1:
+                self.sayfa += 1
+            await interaction.response.edit_message(embed=self.embed_olustur(), view=self)
+
+    view = SayfaView()
+    await ctx.send(embed=view.embed_olustur(), view=view if len(sayfalar) > 1 else None)
 
 
-@bot.tree.command(name="partner-sifirla", description="Tüm partner kayıtlarını siler")
-@app_commands.checks.has_permissions(administrator=True)
-async def partner_sifirla(interaction: discord.Interaction):
-    """Onay butonu ile tüm partner kayıtlarını siler."""
+@bot.command(name="partner-sifirla", aliases=["p-sifirla"])
+@commands.has_permissions(administrator=True)
+async def partner_sifirla(ctx):
+    """.partner-sifirla — Tüm partner kayıtlarını siler (onay butonu ile)."""
+
     class OnayView(discord.ui.View):
         def __init__(self):
             super().__init__(timeout=30)
-        @discord.ui.button(label="Evet, Sıfırla", style=discord.ButtonStyle.danger, emoji="⚠️")
-        async def onayla(self, btn_i: discord.Interaction, button: discord.ui.Button):
+
+        @discord.ui.button(label="✅ Evet, Sıfırla", style=discord.ButtonStyle.danger)
+        async def onayla(self, interaction: discord.Interaction, button: discord.ui.Button):
             ayarlar = ayarlari_yukle()
-            gk = str(btn_i.guild_id)
+            gk = str(interaction.guild_id)
             if gk in ayarlar:
                 ayarlar[gk].pop("partners", None)
                 ayarlar[gk].pop("yetkili_partnerleri", None)
                 ayarlari_kaydet(ayarlar)
-            await btn_i.response.edit_message(embed=discord.Embed(
-                title="🗑️ Partner Kayıtları Silindi", color=RENKLER["hata"]
+            await interaction.response.edit_message(embed=discord.Embed(
+                title="🗑️ Partner Kayıtları Silindi",
+                description="Tüm partner kayıtları ve yetkili sıralaması silindi.",
+                color=RENKLER["hata"]
             ), view=None)
-        @discord.ui.button(label="İptal", style=discord.ButtonStyle.secondary, emoji="✖️")
-        async def iptal(self, btn_i: discord.Interaction, button: discord.ui.Button):
-            await btn_i.response.edit_message(embed=discord.Embed(
-                title="✅ İptal Edildi", color=RENKLER["basari"]
+
+        @discord.ui.button(label="✖️ İptal", style=discord.ButtonStyle.secondary)
+        async def iptal(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await interaction.response.edit_message(embed=discord.Embed(
+                title="✅ İptal Edildi",
+                description="İşlem iptal edildi, kayıtlar korundu.",
+                color=RENKLER["basari"]
             ), view=None)
-    await interaction.response.send_message(embed=discord.Embed(
+
+    await ctx.send(embed=discord.Embed(
         title="⚠️ Emin misiniz?",
         description="Tüm partner kayıtları ve yetkili sıralaması **kalıcı olarak** silinecek!",
         color=RENKLER["hata"]
-    ), view=OnayView(), ephemeral=True)
+    ), view=OnayView())
 
-
-# ── Partner Kanalı — Mesaj Kontrolü & Otomatik Kayıt ────────────
-import re
-DAVET_REGEX = re.compile(r"discord(?:\.gg|app\.com/invite|\.com/invite)/[a-zA-Z0-9\-]+")
-
-@bot.event
-async def on_message(message: discord.Message):
-    """
-    Partner kanalına gelen mesajları kontrol eder:
-        1. Davet linki yok → mesajı sil, uyarı at (5sn sonra uyarı silinir)
-        2. Davet linki var → partneri kaydet, istatistik embedini gönder, log at
-           (yetkili bazlı sayaç da güncellenir)
-    """
-    if message.author.bot:
-        await bot.process_commands(message)
-        return
-
-    if message.guild:
-        partner_ch_id = partner_kanal_id_al(message.guild.id)
-        if partner_ch_id and message.channel.id == partner_ch_id:
-
-            # ── Davet linki kontrolü ─────────────────────────
-            eslesen = DAVET_REGEX.search(message.content)
-            if not eslesen:
-                # Davet yok → sil ve uyar
-                try:
-                    await message.delete()
-                except discord.Forbidden:
-                    pass
-                uyari = await message.channel.send(embed=discord.Embed(
-                    title="❌ Geçersiz Partner Metni",
-                    description=(
-                        f"{message.author.mention} Partner metninizde Discord davet linki bulunamadı.\n"
-                        "Mesajınız silindi."
-                    ),
-                    color=RENKLER["hata"]
-                ))
-                await asyncio.sleep(5)
-                try:
-                    await uyari.delete()
-                except discord.NotFound:
-                    pass
-                return
-
-            # ── Davet linki var → kaydet ─────────────────────
-            # Sunucu adı olarak mesajın ilk satırını kullan (yoksa "Bilinmiyor")
-            ilk_satir = message.content.strip().split("\n")[0][:50]
-            sunucu_adi = ilk_satir if ilk_satir else "Bilinmiyor"
-            simdi = datetime.now(timezone.utc)
-
-            # Bekleme süresi kontrolü — tüm mesajlar için değil,
-            # sunucu bazlı (davet koduna göre) yapılabilir ama
-            # mesajdan sunucu ID'si alınamaz; bu yüzden davet kodunu anahtar olarak kullanıyoruz
-            davet_kodu = eslesen.group(0).split("/")[-1]
-            partners = partner_verisi_al(message.guild.id)
-
-            if davet_kodu in partners:
-                son_zaman_str = partners[davet_kodu].get("son_partner")
-                if son_zaman_str:
-                    son_zaman = datetime.fromisoformat(son_zaman_str).replace(tzinfo=timezone.utc)
-                    gecen = (simdi - son_zaman).total_seconds()
-                    if gecen < PARTNER_BEKLEME_SURESI:
-                        kalan  = int(PARTNER_BEKLEME_SURESI - gecen)
-                        onceki = partners[davet_kodu].get("yapan_id")
-                        try:
-                            await message.delete()
-                        except discord.Forbidden:
-                            pass
-                        uyari = await message.channel.send(embed=discord.Embed(
-                            title="⏳ Bekleme Süresi Dolmadı",
-                            description=(
-                                f"{message.author.mention} Bu sunucuyla tekrar partner yapmak için\n"
-                                f"**{kalan // 60} dakika {kalan % 60} saniye** beklemeniz gerekiyor.\n"
-                                f"Son partner: <@{onceki}> tarafından yapıldı."
-                            ),
-                            color=RENKLER["mute"]
-                        ))
-                        await asyncio.sleep(7)
-                        try:
-                            await uyari.delete()
-                        except discord.NotFound:
-                            pass
-                        return
-
-            # Kaydı oluştur (anahtar: davet kodu)
-            kayit = {
-                "guild_name":  sunucu_adi,
-                "guild_id":    davet_kodu,
-                "yapan":       str(message.author),
-                "yapan_id":    message.author.id,
-                "zaman":       simdi.isoformat(),
-                "son_partner": simdi.isoformat()
-            }
-            ayarlar = ayarlari_yukle()
-            gk = str(message.guild.id)
-            if gk not in ayarlar: ayarlar[gk] = {}
-            if "partners" not in ayarlar[gk]: ayarlar[gk]["partners"] = {}
-            ayarlar[gk]["partners"][davet_kodu] = kayit
-            ayarlari_kaydet(ayarlar)
-
-            # Yetkili sayacını güncelle
-            yetkili_partner_sayisi_guncelle(message.guild.id, message.author.id, str(message.author))
-
-            # İstatistik hesapla
-            stats = partner_istatistik_hesapla(message.guild.id)
-            sira  = partner_sira_bul(message.guild.id)
-            yetkili_sira = next(
-                (i+1 for i, y in enumerate(yetkili_siralamasi_al(message.guild.id)) if y["id"] == str(message.author.id)),
-                "?"
-            )
-            yetkili_toplam = next(
-                (y["sayi"] for y in yetkili_siralamasi_al(message.guild.id) if y["id"] == str(message.author.id)),
-                1
-            )
-
-            # İstatistik embedini kanala gönder
-            stats_embed = discord.Embed(
-                title="🤝 Yeni Partner Yapıldı!",
-                description=f"{message.author.mention} yeni bir partnerlik yaptı!",
-                color=0x57F287,
-                timestamp=simdi
-            )
-            stats_embed.add_field(name="📊 Sunucu Sıralaması", value=f"**#{sira}**", inline=True)
-            stats_embed.add_field(name="👤 Yetkili Sıralaması", value=f"**#{yetkili_sira}** ({yetkili_toplam} partnerlik)", inline=True)
-            stats_embed.add_field(
-                name="🕐 Zamana Dayalı:",
-                value=(
-                    f"› Günlük: **{stats['gunluk']}**\n"
-                    f"› Haftalık: **{stats['haftalik']}**\n"
-                    f"› Aylık: **{stats['aylik']}**"
-                ),
-                inline=True
-            )
-            stats_embed.add_field(name="• Toplam", value=f"**{stats['toplam']}**", inline=True)
-            stats_embed.set_footer(text=f"{bot.user.name} • Partner Sistemi")
-            if message.guild.icon:
-                stats_embed.set_thumbnail(url=message.guild.icon.url)
-            await message.channel.send(embed=stats_embed)
-
-            # Log kanalına gönder
-            log_kanal_id = partner_log_kanali_al(message.guild.id)
-            if log_kanal_id:
-                log_kanal = message.guild.get_channel(log_kanal_id)
-                if log_kanal:
-                    log_embed = discord.Embed(title="📋 Partner Logu", color=0x57F287, timestamp=simdi)
-                    log_embed.add_field(name="🔗 Davet Kodu",   value=f"`{davet_kodu}`",                       inline=True)
-                    log_embed.add_field(name="👤 Yapan Yetkili", value=message.author.mention,                 inline=True)
-                    log_embed.add_field(name="📅 Zaman",         value=simdi.strftime("%d.%m.%Y %H:%M UTC"),   inline=True)
-                    log_embed.add_field(name="📊 Toplam",        value=str(stats["toplam"]),                   inline=True)
-                    log_embed.add_field(name="👤 Yetkili Toplamı", value=str(yetkili_toplam),                  inline=True)
-                    log_embed.set_footer(text=zaman_damgasi())
-                    await log_kanal.send(embed=log_embed)
-
-            return  # process_commands'a gerek yok
-
-    await bot.process_commands(message)
-
-
-@partner_kur.error
-@partner_istatistik.error
-@partner_top.error
-@partner_liste.error
-@partner_sifirla.error
-async def partner_hata(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message(embed=discord.Embed(
-            title="❌ Yetersiz Yetki",
-            description="Bu komutu kullanmak için **Sunucuyu Yönet** iznine ihtiyacınız var.",
-            color=RENKLER["hata"]
-        ), ephemeral=True)
 
 
 
@@ -1933,7 +1791,7 @@ async def yardim(ctx):
         timestamp=datetime.now(timezone.utc)
     )
     embed.add_field(
-        name="🛡️ Moderasyon (.prefix)",
+        name="🛡️ Moderasyon",
         value=(
             "`.ban @üye [sebep]` ┗ Banlar\n"
             "`.unban <id> [sebep]` ┗ Ban kaldırır\n"
@@ -1948,13 +1806,13 @@ async def yardim(ctx):
         inline=False
     )
     embed.add_field(
-        name="🤝 Partner Sistemi (/slash)",
+        name="🤝 Partner Sistemi",
         value=(
-            "`/partner-kur` ┗ Text ve log kanallarını ayarlar\n"
-            "`/partner-istatistik` ┗ Günlük/haftalık/aylık/toplam\n"
-            "`/partner-top` ┗ 🥇🥈🥉 Yetkili sıralaması\n"
-            "`/partner-liste` ┗ Tüm partner sunucuları\n"
-            "`/partner-sifirla` ┗ Tüm kayıtları sıfırlar"
+            "`.partner-kur #text #log` ┗ Kanalları ayarlar\n"
+            "`.partner-istatistik` ┗ Günlük/haftalık/aylık/toplam\n"
+            "`.partner-top` ┗ 🥇🥈🥉 Yetkili sıralaması\n"
+            "`.partner-liste` ┗ Tüm partner sunucuları\n"
+            "`.partner-sifirla` ┗ Tüm kayıtları sıfırlar"
         ),
         inline=False
     )
