@@ -1837,6 +1837,157 @@ async def yardim(ctx):
 # ─────────────────────────────────────────
 
 
+
+# ─────────────────────────────────────────
+#  PARTNER KANALI — MESAJ KONTROLÜ
+# ─────────────────────────────────────────
+
+import re
+DAVET_REGEX = re.compile(r"discord(?:\.gg|app\.com/invite|\.com/invite)/[a-zA-Z0-9\-]+")
+
+@bot.event
+async def on_message(message: discord.Message):
+    """
+    Partner kanalına gelen mesajları kontrol eder:
+      - Davet linki YOK → mesajı sil, 5sn uyarı
+      - Davet linki VAR ama 1 saat geçmemiş → sil, bekleme süresi söyle
+      - Davet linki VAR ve geçerli → kaydet, istatistik göster, log at
+    Diğer kanallarda prefix komutlarını işle.
+    """
+    if message.author.bot:
+        await bot.process_commands(message)
+        return
+
+    if message.guild:
+        partner_ch_id = partner_kanal_id_al(message.guild.id)
+        if partner_ch_id and message.channel.id == partner_ch_id:
+
+            # Davet linki var mı?
+            eslesen = DAVET_REGEX.search(message.content)
+
+            if not eslesen:
+                # Davet linki yok → sil ve uyar
+                try:
+                    await message.delete()
+                except discord.Forbidden:
+                    pass
+                uyari = await message.channel.send(embed=discord.Embed(
+                    title="❌ Geçersiz Partner Metni",
+                    description=f"{message.author.mention} Mesajınızda Discord davet linki bulunamadı. Mesajınız silindi.",
+                    color=RENKLER["hata"]
+                ))
+                await asyncio.sleep(5)
+                try:
+                    await uyari.delete()
+                except discord.NotFound:
+                    pass
+                return
+
+            # Davet kodu
+            davet_kodu = eslesen.group(0).split("/")[-1]
+            partners = partner_verisi_al(message.guild.id)
+            simdi = datetime.now(timezone.utc)
+
+            # 1 saat bekleme kontrolü
+            if davet_kodu in partners:
+                son_zaman_str = partners[davet_kodu].get("son_partner")
+                if son_zaman_str:
+                    son_zaman = datetime.fromisoformat(son_zaman_str).replace(tzinfo=timezone.utc)
+                    gecen = (simdi - son_zaman).total_seconds()
+                    if gecen < PARTNER_BEKLEME_SURESI:
+                        kalan = int(PARTNER_BEKLEME_SURESI - gecen)
+                        onceki_id = partners[davet_kodu].get("yapan_id")
+                        try:
+                            await message.delete()
+                        except discord.Forbidden:
+                            pass
+                        uyari = await message.channel.send(embed=discord.Embed(
+                            title="⏳ Bekleme Süresi Dolmadı",
+                            description=(
+                                f"{message.author.mention} Bu sunucuyla tekrar partner yapmak için\n"
+                                f"**{kalan // 60} dakika {kalan % 60} saniye** beklemeniz gerekiyor.\n"
+                                f"Son partner: <@{onceki_id}> tarafından yapıldı."
+                            ),
+                            color=RENKLER["mute"]
+                        ))
+                        await asyncio.sleep(7)
+                        try:
+                            await uyari.delete()
+                        except discord.NotFound:
+                            pass
+                        return
+
+            # Kaydet
+            ilk_satir = message.content.strip().split("\n")[0][:50]
+            sunucu_adi = ilk_satir if ilk_satir else "Bilinmiyor"
+
+            kayit = {
+                "guild_name":  sunucu_adi,
+                "guild_id":    davet_kodu,
+                "yapan":       str(message.author),
+                "yapan_id":    message.author.id,
+                "zaman":       simdi.isoformat(),
+                "son_partner": simdi.isoformat()
+            }
+            ayarlar = ayarlari_yukle()
+            gk = str(message.guild.id)
+            if gk not in ayarlar: ayarlar[gk] = {}
+            if "partners" not in ayarlar[gk]: ayarlar[gk]["partners"] = {}
+            ayarlar[gk]["partners"][davet_kodu] = kayit
+            ayarlari_kaydet(ayarlar)
+
+            # Yetkili sayacını güncelle
+            yetkili_partner_sayisi_guncelle(message.guild.id, message.author.id, str(message.author))
+
+            # İstatistik hesapla
+            stats = partner_istatistik_hesapla(message.guild.id)
+            sira  = partner_sira_bul(message.guild.id)
+            yetkili_liste = yetkili_siralamasi_al(message.guild.id)
+            yetkili_sira  = next((i+1 for i, y in enumerate(yetkili_liste) if y["id"] == str(message.author.id)), "?")
+            yetkili_toplam = next((y["sayi"] for y in yetkili_liste if y["id"] == str(message.author.id)), 1)
+
+            # İstatistik embed
+            stats_embed = discord.Embed(
+                title="🤝 Yeni Partner Yapıldı!",
+                description=f"{message.author.mention} yeni bir partnerlik yaptı!",
+                color=0x57F287,
+                timestamp=simdi
+            )
+            stats_embed.add_field(name="📊 Sunucu Sırası", value=f"**#{sira}**", inline=True)
+            stats_embed.add_field(name="👤 Yetkili Sırası", value=f"**#{yetkili_sira}** ({yetkili_toplam} partnerlik)", inline=True)
+            stats_embed.add_field(
+                name="🕐 Zamana Dayalı:",
+                value=(
+                    f"› Günlük: **{stats['gunluk']}**\n"
+                    f"› Haftalık: **{stats['haftalik']}**\n"
+                    f"› Aylık: **{stats['aylik']}**"
+                ),
+                inline=True
+            )
+            stats_embed.add_field(name="• Toplam", value=f"**{stats['toplam']}**", inline=True)
+            stats_embed.set_footer(text=f"{bot.user.name} • Partner Sistemi")
+            if message.guild.icon:
+                stats_embed.set_thumbnail(url=message.guild.icon.url)
+            await message.channel.send(embed=stats_embed)
+
+            # Log kanalına gönder
+            log_kanal_id = partner_log_kanali_al(message.guild.id)
+            if log_kanal_id:
+                log_kanal = message.guild.get_channel(log_kanal_id)
+                if log_kanal:
+                    log_embed = discord.Embed(title="📋 Partner Logu", color=0x57F287, timestamp=simdi)
+                    log_embed.add_field(name="🔗 Davet",        value=f"`{davet_kodu}`",                       inline=True)
+                    log_embed.add_field(name="👤 Yapan",        value=message.author.mention,                  inline=True)
+                    log_embed.add_field(name="📅 Zaman",        value=simdi.strftime("%d.%m.%Y %H:%M UTC"),    inline=True)
+                    log_embed.add_field(name="📊 Toplam",       value=str(stats["toplam"]),                    inline=True)
+                    log_embed.add_field(name="👤 Yetkili Toplamı", value=str(yetkili_toplam),                  inline=True)
+                    log_embed.set_footer(text=zaman_damgasi())
+                    await log_kanal.send(embed=log_embed)
+
+            return
+
+    await bot.process_commands(message)
+
 # ─────────────────────────────────────────
 #  FLASK (RENDER CANLI TUTMAK İÇİN)
 # ─────────────────────────────────────────
