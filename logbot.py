@@ -1699,35 +1699,33 @@ async def kick_hata(ctx, error):
 # ── .mute (timeout) ──────────────────────────────────────────────
 @bot.command(name="mute")
 @commands.has_permissions(moderate_members=True)
-async def mute(ctx, uye: discord.Member, sure: str = None, *, sebep: str = "Sebep belirtilmedi"):
+async def mute(ctx, uye: discord.Member, *, arguman: str = ""):
     """
     .mute @üye [süre] [sebep]
-    Süre formatı: 10s, 5m, 2h, 1d (saniye/dakika/saat/gün)
-    Süre belirtilmezse Discord'un izin verdiği maksimum (28 gün) uygulanır.
+    Tüm argümanları tek string olarak alır, sonra parse eder.
+    Böylece .mute @üye, .mute @üye sebep, .mute @üye 10m sebep hepsi çalışır.
     """
     if uye == ctx.author:
         await ctx.send("❌ Kendinizi susturamassınız."); return
     if uye.top_role >= ctx.author.top_role:
         await ctx.send("❌ Bu üyeyi susturacak yetkiniz yok."); return
 
-    # Süre belirtilmemişse → maksimum Discord süresi (28 gün = 2419200 sn)
-    if sure is None:
-        saniye = 2419200
-        sure_goster = "Süresiz (28 gün maks.)"
-    else:
-        birimler = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-        try:
-            carpan = birimler.get(sure[-1], 60)
-            saniye = int(sure[:-1]) * carpan
-            sure_goster = sure
-        except (ValueError, IndexError):
-            # Süre girilmiş ama format yanlış → sebep olarak kabul et, süresiz yap
-            sebep = sure + (" " + sebep if sebep != "Sebep belirtilmedi" else "")
-            saniye = 2419200
-            sure_goster = "Süresiz (28 gün maks.)"
+    birimler = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    parcalar = arguman.strip().split()
 
-    if saniye > 2419200:
-        await ctx.send("❌ Maksimum süre 28 gündür."); return
+    # İlk kelime süre formatında mı? (örn: 10m, 2h, 1d, 30s)
+    if parcalar and parcalar[0][-1] in birimler and parcalar[0][:-1].isdigit():
+        sure_str = parcalar[0]
+        saniye = int(sure_str[:-1]) * birimler[sure_str[-1]]
+        sebep = " ".join(parcalar[1:]) if len(parcalar) > 1 else "Sebep belirtilmedi"
+        sure_goster = sure_str
+        if saniye > 2419200:
+            await ctx.send("❌ Maksimum süre 28 gündür."); return
+    else:
+        # Süre yok → tüm argüman sebep, süresiz mute
+        saniye = 2419200
+        sure_goster = "Süresiz"
+        sebep = arguman.strip() if arguman.strip() else "Sebep belirtilmedi"
 
     bitis = datetime.now(timezone.utc) + discord.utils.timedelta(seconds=saniye)
     await uye.timeout(discord.utils.timedelta(seconds=saniye), reason=f"{ctx.author}: {sebep}")
