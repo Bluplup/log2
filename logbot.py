@@ -139,7 +139,12 @@ intents.messages        = True
 intents.voice_states    = True
 intents.invites         = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix=".", intents=intents, case_insensitive=True, help_command=None)
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return  # Bilinmeyen komutları sessizce geç
 
 
 # ─────────────────────────────────────────
@@ -1039,6 +1044,20 @@ async def on_guild_channel_update(onceki: discord.abc.GuildChannel, sonraki: dis
 #  BOT HAZIR OLAYI
 # ─────────────────────────────────────────
 
+
+@bot.event
+async def on_command_error(ctx, error):
+    """CommandNotFound ve diğer bilinen hataları sessizce geçer."""
+    if isinstance(error, commands.CommandNotFound):
+        return  # Bilinmeyen komutları yoksay
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Bu komutu kullanmak için yetkin yok.")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ Üye bulunamadı.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Eksik parametre. ``.yardım` ile kullanımı görebilirsin.")
+
+
 @bot.event
 async def on_ready():
     # Slash komutlarını Discord'a senkronize et
@@ -1066,31 +1085,6 @@ async def on_ready():
             name="sunucu loglarını 👁️"
         )
     )
-
-
-# ─────────────────────────────────────────
-#  FLASK (RENDER CANLI TUTMAK İÇİN)
-# ─────────────────────────────────────────
-
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Bot çalışıyor"
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-Thread(target=run_flask).start()
-
-
-# ─────────────────────────────────────────
-#  BOTU BAŞLAT
-# ─────────────────────────────────────────
-
-if __name__ == "__main__":
-    bot.run(BOT_TOKEN)
 
 # ═══════════════════════════════════════════════════════════════
 #  PARTNER SİSTEMİ
@@ -1600,7 +1594,7 @@ def mod_embed(baslik: str, renk: int, **alanlar) -> discord.Embed:
 @bot.command(name="ban")
 @commands.has_permissions(ban_members=True)
 async def ban(ctx, uye: discord.Member, *, sebep: str = "Sebep belirtilmedi"):
-    """!ban @üye [sebep]"""
+    """.ban @üye [sebep]"""
     if uye == ctx.author:
         await ctx.send("❌ Kendinizi banlayamazsınız."); return
     if uye.top_role >= ctx.author.top_role:
@@ -1632,14 +1626,14 @@ async def ban_hata(ctx, error):
     elif isinstance(error, commands.MemberNotFound):
         await ctx.send("❌ Üye bulunamadı.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("📌 Kullanım: `!ban @üye [sebep]`")
+        await ctx.send("📌 Kullanım: ``.ban @üye [sebep]`")
 
 
 # ── !unban ───────────────────────────────────────────────────────
 @bot.command(name="unban")
 @commands.has_permissions(ban_members=True)
 async def unban(ctx, kullanici_id: int, *, sebep: str = "Sebep belirtilmedi"):
-    """!unban <kullanıcı_id> [sebep]"""
+    """.unban <kullanıcı_id> [sebep]"""
     try:
         kullanici = await bot.fetch_user(kullanici_id)
         await ctx.guild.unban(kullanici, reason=f"{ctx.author} tarafından: {sebep}")
@@ -1660,14 +1654,14 @@ async def unban_hata(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ Ban yetkine sahip değilsin.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("📌 Kullanım: `!unban <kullanıcı_id> [sebep]`")
+        await ctx.send("📌 Kullanım: ``.unban <kullanıcı_id> [sebep]`")
 
 
 # ── !kick ────────────────────────────────────────────────────────
 @bot.command(name="kick")
 @commands.has_permissions(kick_members=True)
 async def kick(ctx, uye: discord.Member, *, sebep: str = "Sebep belirtilmedi"):
-    """!kick @üye [sebep]"""
+    """.kick @üye [sebep]"""
     if uye == ctx.author:
         await ctx.send("❌ Kendinizi atamazsınız."); return
     if uye.top_role >= ctx.author.top_role:
@@ -1699,7 +1693,7 @@ async def kick_hata(ctx, error):
     elif isinstance(error, commands.MemberNotFound):
         await ctx.send("❌ Üye bulunamadı.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("📌 Kullanım: `!kick @üye [sebep]`")
+        await ctx.send("📌 Kullanım: ``.kick @üye [sebep]`")
 
 
 # ── !mute (timeout) ──────────────────────────────────────────────
@@ -1746,14 +1740,14 @@ async def mute_hata(ctx, error):
     elif isinstance(error, commands.MemberNotFound):
         await ctx.send("❌ Üye bulunamadı.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("📌 Kullanım: `!mute @üye [süre: 10m] [sebep]`")
+        await ctx.send("📌 Kullanım: ``.mute @üye [süre: 10m] [sebep]`")
 
 
 # ── !unmute ──────────────────────────────────────────────────────
 @bot.command(name="unmute")
 @commands.has_permissions(moderate_members=True)
 async def unmute(ctx, uye: discord.Member, *, sebep: str = "Sebep belirtilmedi"):
-    """!unmute @üye [sebep]"""
+    """.unmute @üye [sebep]"""
     await uye.timeout(None, reason=f"{ctx.author}: {sebep}")
 
     embed = mod_embed("🔊 Timeout Kaldırıldı", RENKLER["unban"],
@@ -1776,7 +1770,7 @@ async def unmute_hata(ctx, error):
 @bot.command(name="sil")
 @commands.has_permissions(manage_messages=True)
 async def sil(ctx, adet: int = 5):
-    """!sil [adet] — Belirtilen sayıda mesajı siler (max 100)"""
+    """.sil [adet] — Belirtilen sayıda mesajı siler (max 100)"""
     if adet < 1 or adet > 100:
         await ctx.send("❌ 1 ile 100 arasında bir sayı girin."); return
 
@@ -1797,14 +1791,14 @@ async def sil_hata(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ Mesaj silme yetkine sahip değilsin.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("📌 Kullanım: `!sil [adet]`")
+        await ctx.send("📌 Kullanım: ``.sil [adet]`")
 
 
 # ── !warn ────────────────────────────────────────────────────────
 @bot.command(name="warn")
 @commands.has_permissions(manage_messages=True)
 async def warn(ctx, uye: discord.Member, *, sebep: str = "Sebep belirtilmedi"):
-    """!warn @üye [sebep] — Üyeye uyarı verir ve settings.json'a kaydeder."""
+    """.warn @üye [sebep] — Üyeye uyarı verir ve settings.json'a kaydeder."""
     # Uyarıyı kaydet
     ayarlar = ayarlari_yukle()
     guild_key = str(ctx.guild.id)
@@ -1852,14 +1846,14 @@ async def warn_hata(ctx, error):
     elif isinstance(error, commands.MemberNotFound):
         await ctx.send("❌ Üye bulunamadı.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("📌 Kullanım: `!warn @üye [sebep]`")
+        await ctx.send("📌 Kullanım: ``.warn @üye [sebep]`")
 
 
 # ── !uyarılar ────────────────────────────────────────────────────
 @bot.command(name="uyarılar", aliases=["warnings", "uyarilar"])
 @commands.has_permissions(manage_messages=True)
 async def uyarilar(ctx, uye: discord.Member):
-    """!uyarılar @üye — Üyenin uyarı geçmişini gösterir."""
+    """.uyarılar @üye — Üyenin uyarı geçmişini gösterir."""
     ayarlar = ayarlari_yukle()
     liste = ayarlar.get(str(ctx.guild.id), {}).get("uyarilar", {}).get(str(uye.id), [])
 
@@ -1898,14 +1892,14 @@ async def uyarilar_hata(ctx, error):
     if isinstance(error, commands.MemberNotFound):
         await ctx.send("❌ Üye bulunamadı.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("📌 Kullanım: `!uyarılar @üye`")
+        await ctx.send("📌 Kullanım: ``.uyarılar @üye`")
 
 
 # ── !uyarısil ────────────────────────────────────────────────────
 @bot.command(name="uyarısil", aliases=["uyarisil", "clearwarns"])
 @commands.has_permissions(manage_guild=True)
 async def uyari_sil(ctx, uye: discord.Member):
-    """!uyarısil @üye — Üyenin tüm uyarılarını siler."""
+    """.uyarısil @üye — Üyenin tüm uyarılarını siler."""
     ayarlar = ayarlari_yukle()
     guild_key = str(ctx.guild.id)
     uye_key = str(uye.id)
@@ -1925,7 +1919,7 @@ async def uyari_sil(ctx, uye: discord.Member):
 # ── !yardım ──────────────────────────────────────────────────────
 @bot.command(name="yardım", aliases=["yardim", "help"])
 async def yardim(ctx):
-    """!yardım — Tüm komutları listeler."""
+    """.yardım — Tüm komutları listeler."""
     embed = discord.Embed(
         title="📖 Komut Listesi",
         color=RENKLER["bilgi"],
@@ -1934,15 +1928,15 @@ async def yardim(ctx):
     embed.add_field(
         name="🛡️ Moderasyon (!prefix)",
         value=(
-            "`!ban @üye [sebep]` — Banlar\n"
-            "`!unban <id> [sebep]` — Ban kaldırır\n"
-            "`!kick @üye [sebep]` — Atar\n"
-            "`!mute @üye [süre] [sebep]` — Susturur (10s/5m/2h/1d)\n"
-            "`!unmute @üye` — Susturmayı kaldırır\n"
-            "`!sil [adet]` — Mesaj siler (max 100)\n"
-            "`!warn @üye [sebep]` — Uyarı verir\n"
-            "`!uyarılar @üye` — Uyarıları gösterir\n"
-            "`!uyarısil @üye` — Uyarıları temizler"
+            "``.ban @üye [sebep]` — Banlar\n"
+            "``.unban <id> [sebep]` — Ban kaldırır\n"
+            "``.kick @üye [sebep]` — Atar\n"
+            "``.mute @üye [süre] [sebep]` — Susturur (10s/5m/2h/1d)\n"
+            "``.unmute @üye` — Susturmayı kaldırır\n"
+            "``.sil [adet]` — Mesaj siler (max 100)\n"
+            "``.warn @üye [sebep]` — Uyarı verir\n"
+            "``.uyarılar @üye` — Uyarıları gösterir\n"
+            "``.uyarısil @üye` — Uyarıları temizler"
         ),
         inline=False
     )
@@ -1959,3 +1953,26 @@ async def yardim(ctx):
     )
     embed.set_footer(text=zaman_damgasi())
     await ctx.send(embed=embed)
+
+# ─────────────────────────────────────────
+#  FLASK (RENDER CANLI TUTMAK İÇİN)
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot çalışıyor"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+Thread(target=run_flask).start()
+
+
+# ─────────────────────────────────────────
+#  BOTU BAŞLAT
+# ─────────────────────────────────────────
+
+if __name__ == "__main__":
+    bot.run(BOT_TOKEN)
