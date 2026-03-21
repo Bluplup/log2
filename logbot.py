@@ -1696,28 +1696,37 @@ async def kick_hata(ctx, error):
         await ctx.send("📌 Kullanım: ``.kick @üye [sebep]`")
 
 
-# ── !mute (timeout) ──────────────────────────────────────────────
+# ── .mute (timeout) ──────────────────────────────────────────────
 @bot.command(name="mute")
 @commands.has_permissions(moderate_members=True)
-async def mute(ctx, uye: discord.Member, sure: str = "10m", *, sebep: str = "Sebep belirtilmedi"):
+async def mute(ctx, uye: discord.Member, sure: str = None, *, sebep: str = "Sebep belirtilmedi"):
     """
-    !mute @üye [süre] [sebep]
+    .mute @üye [süre] [sebep]
     Süre formatı: 10s, 5m, 2h, 1d (saniye/dakika/saat/gün)
+    Süre belirtilmezse Discord'un izin verdiği maksimum (28 gün) uygulanır.
     """
     if uye == ctx.author:
         await ctx.send("❌ Kendinizi susturamassınız."); return
     if uye.top_role >= ctx.author.top_role:
         await ctx.send("❌ Bu üyeyi susturacak yetkiniz yok."); return
 
-    # Süreyi parse et
-    birimler = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-    try:
-        carpan = birimler.get(sure[-1], 60)
-        saniye = int(sure[:-1]) * carpan
-    except (ValueError, IndexError):
-        await ctx.send("❌ Geçersiz süre. Örnek: `10m`, `2h`, `1d`"); return
+    # Süre belirtilmemişse → maksimum Discord süresi (28 gün = 2419200 sn)
+    if sure is None:
+        saniye = 2419200
+        sure_goster = "Süresiz (28 gün maks.)"
+    else:
+        birimler = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+        try:
+            carpan = birimler.get(sure[-1], 60)
+            saniye = int(sure[:-1]) * carpan
+            sure_goster = sure
+        except (ValueError, IndexError):
+            # Süre girilmiş ama format yanlış → sebep olarak kabul et, süresiz yap
+            sebep = sure + (" " + sebep if sebep != "Sebep belirtilmedi" else "")
+            saniye = 2419200
+            sure_goster = "Süresiz (28 gün maks.)"
 
-    if saniye > 2419200:  # Discord max: 28 gün
+    if saniye > 2419200:
         await ctx.send("❌ Maksimum süre 28 gündür."); return
 
     bitis = datetime.now(timezone.utc) + discord.utils.timedelta(seconds=saniye)
@@ -1725,7 +1734,7 @@ async def mute(ctx, uye: discord.Member, sure: str = "10m", *, sebep: str = "Seb
 
     embed = mod_embed("🔇 Üye Susturuldu", RENKLER["mute"],
         **{"👤 Üye": f"{uye.mention} `{uye}`",
-           "⏱️ Süre": sure,
+           "⏱️ Süre": sure_goster,
            "⏰ Bitiş": bitis.strftime("%d.%m.%Y %H:%M UTC"),
            "📝 Sebep": sebep,
            "🛡️ Yetkili": ctx.author.mention})
@@ -1740,7 +1749,7 @@ async def mute_hata(ctx, error):
     elif isinstance(error, commands.MemberNotFound):
         await ctx.send("❌ Üye bulunamadı.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("📌 Kullanım: ``.mute @üye [süre: 10m] [sebep]`")
+        await ctx.send("📌 Kullanım: `.mute @üye [süre] [sebep]`")
 
 
 # ── !unmute ──────────────────────────────────────────────────────
@@ -1919,43 +1928,62 @@ async def uyari_sil(ctx, uye: discord.Member):
 # ── !yardım ──────────────────────────────────────────────────────
 @bot.command(name="yardım", aliases=["yardim", "help"])
 async def yardim(ctx):
-    """.yardım — Tüm komutları listeler."""
     embed = discord.Embed(
-        title="📖 Komut Listesi",
-        color=RENKLER["bilgi"],
+        title="📖 Komut Rehberi",
+        description="Botun tüm komutları aşağıda listelenmiştir.",
+        color=0x5865F2,
         timestamp=datetime.now(timezone.utc)
     )
     embed.add_field(
-        name="🛡️ Moderasyon (!prefix)",
+        name="🛡️ Moderasyon (.prefix)",
         value=(
-            "``.ban @üye [sebep]` — Banlar\n"
-            "``.unban <id> [sebep]` — Ban kaldırır\n"
-            "``.kick @üye [sebep]` — Atar\n"
-            "``.mute @üye [süre] [sebep]` — Susturur (10s/5m/2h/1d)\n"
-            "``.unmute @üye` — Susturmayı kaldırır\n"
-            "``.sil [adet]` — Mesaj siler (max 100)\n"
-            "``.warn @üye [sebep]` — Uyarı verir\n"
-            "``.uyarılar @üye` — Uyarıları gösterir\n"
-            "``.uyarısil @üye` — Uyarıları temizler"
+            "`.ban @üye [sebep]` ┗ Banlar\n"
+            "`.unban <id> [sebep]` ┗ Ban kaldırır\n"
+            "`.kick @üye [sebep]` ┗ Atar\n"
+            "`.mute @üye [süre] [sebep]` ┗ Susturur · süre boş = kalıcı\n"
+            "`.unmute @üye` ┗ Susturmayı kaldırır\n"
+            "`.sil [adet]` ┗ Mesaj siler (max 100)\n"
+            "`.warn @üye [sebep]` ┗ Uyarı verir\n"
+            "`.uyarılar @üye` ┗ Uyarıları gösterir\n"
+            "`.uyarısil @üye` ┗ Uyarıları temizler"
         ),
         inline=False
     )
     embed.add_field(
         name="🤝 Partner Sistemi (/slash)",
         value=(
-            "`/partner-kaydet` — Partner kaydeder\n"
-            "`/partner-istatistik` — İstatistikleri gösterir\n"
-            "`/partner-liste` — Tüm partnerleri listeler\n"
-            "`/partner-kanal` — Log kanalı ayarlar\n"
-            "`/partner-sifirla` — Tüm kayıtları siler"
+            "`/partner-kur` ┗ Text ve log kanallarını ayarlar\n"
+            "`/partner-istatistik` ┗ Günlük/haftalık/aylık/toplam\n"
+            "`/partner-top` ┗ 🥇🥈🥉 Yetkili sıralaması\n"
+            "`/partner-liste` ┗ Tüm partner sunucuları\n"
+            "`/partner-sifirla` ┗ Tüm kayıtları sıfırlar"
         ),
         inline=False
     )
-    embed.set_footer(text=zaman_damgasi())
+    embed.add_field(
+        name="📋 Log Sistemi (/slash)",
+        value=(
+            "`/log-kur` ┗ Log kanalı atar\n"
+            "`/log-kaldir` ┗ Log türünü kapatır\n"
+            "`/log-durum` ┗ Tüm log durumlarını gösterir\n"
+            "`/log-sifirla` ┗ Log ayarlarını sıfırlar"
+        ),
+        inline=False
+    )
+    embed.set_footer(text=f"{ctx.guild.name} • {zaman_damgasi()}")
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
     await ctx.send(embed=embed)
+
+
+# ─────────────────────────────────────────
+#  BOTU BAŞLAT
+# ─────────────────────────────────────────
+
 
 # ─────────────────────────────────────────
 #  FLASK (RENDER CANLI TUTMAK İÇİN)
+# ─────────────────────────────────────────
 
 app = Flask(__name__)
 
@@ -1969,10 +1997,6 @@ def run_flask():
 
 Thread(target=run_flask).start()
 
-
-# ─────────────────────────────────────────
-#  BOTU BAŞLAT
-# ─────────────────────────────────────────
 
 if __name__ == "__main__":
     bot.run(BOT_TOKEN)
