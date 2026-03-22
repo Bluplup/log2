@@ -1,1 +1,0 @@
-worker: python logbot.py
