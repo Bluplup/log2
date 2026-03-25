@@ -18,12 +18,19 @@ Komutlar (Slash komutları):
 import discord
 from discord import app_commands
 from discord.ext import commands
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import asyncio
+import html
+import io
 import json
 import os
+import secrets
+import socket
+import urllib.error
+import urllib.request
 from flask import Flask
-from threading import Thread
+from threading import Thread, RLock
+import time
 
 # ─────────────────────────────────────────
 #  AYARLAR
@@ -36,7 +43,253 @@ from threading import Thread
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "") or os.environ.get("DISCORD_TOKEN", "")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN veya DISCORD_TOKEN environment variable ayarlanmamis! Render'da Environment sekmesine ekle.")
-AYAR_DOSYASI = "settings.json"      # Kanal ID'leri burada saklanır
+# Kalici ayar depolama:
+# - SUPABASE_URL + SUPABASE_KEY varsa ayarlar Supabase'te tutulur
+# - Yoksa en son fallback olarak settings.json kullanilir
+AYAR_DOSYASI = os.environ.get("SETTINGS_PATH", "/opt/render/project/src/data/settings.json")
+if not os.path.isabs(AYAR_DOSYASI):
+    AYAR_DOSYASI = os.path.abspath(AYAR_DOSYASI)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip() or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "bot_settings").strip() or "bot_settings"
+# Bu surece ozel ID (loglarda / Mongo heartbeat — baska yerde calisan kopyayi ayirt etmek icin)
+BOT_INSTANCE_ID = secrets.token_hex(8)
+_ayar_dosya_kilidi = RLock()
+_supabase_disabled_until = 0.0
+_supabase_fail_count = 0
+_ayar_cache_veri = None
+_ayar_cache_zaman = 0.0
+_AYAR_CACHE_TTL = float(os.environ.get("SETTINGS_CACHE_TTL", "8"))
+
+
+def supabase_aktif_mi() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def mongo_aktif_mi() -> bool:
+    return False
+
+
+def _supabase_gecici_devre_disi_mi() -> bool:
+    return time.monotonic() < _supabase_disabled_until
+
+
+def _supabase_hata_koruma_aktif_et():
+    global _supabase_disabled_until, _supabase_fail_count
+    _supabase_fail_count += 1
+    bekleme = min(300, 30 * _supabase_fail_count)
+    _supabase_disabled_until = time.monotonic() + bekleme
+    print(f"[UYARI] Supabase gecici devre disi ({bekleme}s), yerel fallback aktif.")
+
+
+def _supabase_headers(ekstra: dict | None = None) -> dict:
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if ekstra:
+        headers.update(ekstra)
+    return headers
+
+
+def _supabase_istek(path: str, method: str = "GET", payload=None, extra_headers: dict | None = None, timeout: int = 20):
+    if not supabase_aktif_mi() or _supabase_gecici_devre_disi_mi():
+        return None
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}{path}",
+        data=data,
+        headers=_supabase_headers(extra_headers),
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ham = resp.read().decode("utf-8")
+        global _supabase_fail_count
+        _supabase_fail_count = 0
+        return json.loads(ham) if ham else True
+    except urllib.error.HTTPError as e:
+        try:
+            detay = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            detay = str(e)
+        print(f"[HATA] Supabase HTTP {e.code}: {detay}")
+        _supabase_hata_koruma_aktif_et()
+        return None
+    except Exception as e:
+        print(f"[HATA] Supabase baglantisi basarisiz: {e}")
+        _supabase_hata_koruma_aktif_et()
+        return None
+
+
+def _supabase_prefix_kilit_ekle_sync(lock_id: str) -> bool | None:
+    if not supabase_aktif_mi() or _supabase_gecici_devre_disi_mi():
+        return None
+    payload = [{
+        "id": f"lock:{lock_id}",
+        "data": {
+            "type": "prefix_lock",
+            "instance": BOT_INSTANCE_ID,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }]
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=_supabase_headers({"Prefer": "return=minimal"}),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            return False
+        try:
+            detay = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            detay = str(e)
+        print(f"[UYARI] Supabase prefix kilidi HTTP {e.code}: {detay}")
+        return None
+    except Exception as e:
+        print(f"[UYARI] Supabase prefix kilidi baglanti hatasi: {e}")
+        return None
+
+
+_prefix_kilit_mongo_uyari = False
+
+
+def _mongo_prefix_lock_koleksiyon():
+    return None
+
+
+def _upstash_kilit_env_var_mi() -> bool:
+    u = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip()
+    t = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+    return bool(u and t)
+
+
+def _upstash_set_nx_sync(key: str, ex_sn: int = 180) -> bool:
+    url = os.environ["UPSTASH_REDIS_REST_URL"].strip().rstrip("/")
+    token = os.environ["UPSTASH_REDIS_REST_TOKEN"].strip()
+    body = json.dumps(["SET", key, "1", "NX", "EX", str(ex_sn)]).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        out = json.loads(resp.read().decode("utf-8"))
+    return out.get("result") == "OK"
+
+
+def _prefix_mesaj_kilidi_dene_sync(channel_id: int, message_id: int) -> bool:
+    """
+    True  -> Bu süreç prefix komutunu çalıştırmalı (kilit alındı).
+    False -> Başka bir süreç / bot aynı mesaj için kilidi zaten aldı.
+    """
+    global _prefix_kilit_mongo_uyari
+    lock_id = f"{channel_id}_{message_id}"
+    supabase_sonuc = _supabase_prefix_kilit_ekle_sync(lock_id)
+    if supabase_sonuc is not None:
+        return supabase_sonuc
+
+    if _upstash_kilit_env_var_mi():
+        try:
+            return _upstash_set_nx_sync(f"logbot:pcmd:{lock_id}", ex_sn=180)
+        except Exception as e:
+            print(f"[UYARI] Prefix kilidi Upstash: {e}")
+
+    if not _prefix_kilit_mongo_uyari:
+        _prefix_kilit_mongo_uyari = True
+        print(
+            "[UYARI] Prefix kilidi kapali (Upstash yok/bozuk). "
+            "Sunucuda iki ayri Discord BOT UYGULAMASI varsa her ikisi de cevap verir — fazla botu sunucudan at veya tek bot kullan."
+        )
+    return True
+
+
+def _prefix_dagitik_kilit_istiyor_mu() -> bool:
+    """
+    Varsayilan KAPALI: her komutta Mongo/HTTP round-trip olmaz, cevap hizli olur.
+    Iki ayri bot/deploy ayni mesaja cift cevap veriyorsa Render'da ac:
+        PREFIX_CMD_LOCK=1
+    """
+    v = os.environ.get("PREFIX_CMD_LOCK", os.environ.get("PREFIX_CMD_DEDUP", "")).strip().lower()
+    if v in ("1", "true", "yes", "evet", "on", "acik", "ac"):
+        return True
+    return supabase_aktif_mi() or _upstash_kilit_env_var_mi()
+
+
+async def _prefix_mesaj_kilidi_dene(channel_id: int, message_id: int) -> bool:
+    return await asyncio.to_thread(_prefix_mesaj_kilidi_dene_sync, channel_id, message_id)
+
+
+def _prefix_lock_ttl_index_olustur():
+    return
+
+
+def _bot_surec_log_satirlari() -> list[str]:
+    """Render / lokal konsolda bu sureci tanitmak icin."""
+    parcalar = [f"id={BOT_INSTANCE_ID}", f"pid={os.getpid()}"]
+    try:
+        parcalar.append(f"host={socket.gethostname()[:100]}")
+    except OSError:
+        pass
+    for env_k in ("RENDER_SERVICE_ID", "RENDER_INSTANCE_ID", "FLY_ALLOC_ID", "K_SERVICE", "HOSTNAME"):
+        v = os.environ.get(env_k, "").strip()
+        if v:
+            parcalar.append(f"{env_k}={v[:48]}")
+    return parcalar
+
+
+def _mongo_instance_heartbeat_sync(bot_discord_user_id: int | None) -> tuple[list[dict] | None, str | None]:
+    return None, "supabase_modunda_pasif"
+
+
+async def _bot_coklu_surec_izleme_dongusu():
+    """Aralikli olarak coklu surec bilgisini konsola yazar."""
+    await bot.wait_until_ready()
+    ilk_uyarni = True
+    while not bot.is_closed():
+        try:
+            uid = int(bot.user.id) if bot.user else None
+            aktif, hata = await asyncio.to_thread(_mongo_instance_heartbeat_sync, uid)
+            if hata:
+                if hata in ("mongo_kapali", "mongo_baglanamadi", "supabase_modunda_pasif"):
+                    if ilk_uyarni:
+                        print(
+                            f"  ℹ️  Coklu-surec izleme: harici surec izleme pasif — baska yerde calisan kopyayi "
+                            f"sadece PID/host satirindan veya sunucudaki bot sayisindan kontrol et."
+                        )
+                        ilk_uyarni = False
+                else:
+                    print(f"  [UYARI] Instance heartbeat: {hata}")
+            elif aktif is not None:
+                if len(aktif) > 1:
+                    ozet = []
+                    for d in aktif:
+                        iid = str(d.get("_id", ""))[:10]
+                        ozet.append(
+                            f"{iid}.. pid={d.get('pid')} @{str(d.get('host', ''))[:24]}"
+                        )
+                    print(
+                        f"  ⚠️  {len(aktif)} AYRI SUREC (son ~2dk) — cift mesaj normal: "
+                        f"{' | '.join(ozet)}"
+                    )
+                elif ilk_uyarni:
+                    print(
+                        f"  ✅ Coklu-surec izleme: Mongo'da son 2 dk icinde yalniz bu instance kayitli "
+                        f"({BOT_INSTANCE_ID[:10]}..)"
+                    )
+                    ilk_uyarni = False
+        except Exception as e:
+            print(f"  [UYARI] Instance izleme dongusu: {e}")
+        await asyncio.sleep(75)
 
 # ─────────────────────────────────────────
 #  SABİT LOG KANALLARI (deploy'dan etkilenmez)
@@ -121,14 +374,41 @@ RENKLER = {
 
 def ayarlari_yukle() -> dict:
     """
-    settings.json dosyasını okur.
+    Önce Supabase'ten, yoksa yerel fallback dosyasından ayarları okur.
     Yapı: { "guild_id": { "log_turu": kanal_id, ... }, ... }
     Dosya yoksa boş dict döndürür.
     """
-    if not os.path.exists(AYAR_DOSYASI):
-        return {}
-    with open(AYAR_DOSYASI, "r", encoding="utf-8") as f:
-        return json.load(f)
+    global _ayar_cache_veri, _ayar_cache_zaman
+    simdi = time.monotonic()
+    if _ayar_cache_veri is not None and (simdi - _ayar_cache_zaman) < _AYAR_CACHE_TTL:
+        return json.loads(json.dumps(_ayar_cache_veri))
+
+    if supabase_aktif_mi():
+        belge = _supabase_istek(
+            f"/rest/v1/{SUPABASE_TABLE}?id=eq.global_settings&select=data",
+            extra_headers={"Accept": "application/json"},
+        )
+        if isinstance(belge, list) and belge:
+            veri = belge[0].get("data", {}) or {}
+            _ayar_cache_veri = veri
+            _ayar_cache_zaman = simdi
+            return json.loads(json.dumps(veri))
+
+    with _ayar_dosya_kilidi:
+        klasor = os.path.dirname(AYAR_DOSYASI)
+        if klasor:
+            os.makedirs(klasor, exist_ok=True)
+        if not os.path.exists(AYAR_DOSYASI):
+            return {}
+        try:
+            with open(AYAR_DOSYASI, "r", encoding="utf-8") as f:
+                veri = json.load(f)
+                _ayar_cache_veri = veri
+                _ayar_cache_zaman = simdi
+                return json.loads(json.dumps(veri))
+        except json.JSONDecodeError as e:
+            print(f"[HATA] settings.json bozuk, bos ayarlarla devam edilecek: {e}")
+            return {}
 
 
 def varsayilan_kanallari_yukle(guild_id: int):
@@ -151,9 +431,46 @@ def varsayilan_kanallari_yukle(guild_id: int):
 
 
 def ayarlari_kaydet(veri: dict):
-    """Tüm ayarları settings.json dosyasına yazar."""
-    with open(AYAR_DOSYASI, "w", encoding="utf-8") as f:
-        json.dump(veri, f, indent=2, ensure_ascii=False)
+    """Tüm ayarları önce Supabase'e, o yoksa yerel dosyaya yazar."""
+    global _ayar_cache_veri, _ayar_cache_zaman
+    if supabase_aktif_mi():
+        sonuc = _supabase_istek(
+            f"/rest/v1/{SUPABASE_TABLE}?on_conflict=id",
+            method="POST",
+            payload=[{
+                "id": "global_settings",
+                "data": veri,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }],
+            extra_headers={
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+        )
+        if sonuc is not None:
+            _ayar_cache_veri = json.loads(json.dumps(veri))
+            _ayar_cache_zaman = time.monotonic()
+            return
+        print("[UYARI] Supabase'e yazma basarisiz; yerel fallback dosyaya yaziliyor.")
+
+    with _ayar_dosya_kilidi:
+        klasor = os.path.dirname(AYAR_DOSYASI)
+        if klasor:
+            os.makedirs(klasor, exist_ok=True)
+        gecici_dosya = f"{AYAR_DOSYASI}.tmp"
+        with open(gecici_dosya, "w", encoding="utf-8") as f:
+            json.dump(veri, f, indent=2, ensure_ascii=False)
+        os.replace(gecici_dosya, AYAR_DOSYASI)
+        _ayar_cache_veri = json.loads(json.dumps(veri))
+        _ayar_cache_zaman = time.monotonic()
+
+
+def ayarlari_guncelle(guncelleyici):
+    """JSON fallback kullanilirken oku-degistir-yaz akisini tek kilitte toplar."""
+    with _ayar_dosya_kilidi:
+        ayarlar = ayarlari_yukle()
+        sonuc = guncelleyici(ayarlar)
+        ayarlari_kaydet(ayarlar)
+        return sonuc
 
 
 def kanal_al(guild_id: int, tur: str) -> int | None:
@@ -167,30 +484,33 @@ def kanal_al(guild_id: int, tur: str) -> int | None:
 
 def kanal_kaydet(guild_id: int, tur: str, kanal_id: int):
     """Bir log türü için kanal ID'sini settings.json'a kaydeder."""
-    ayarlar = ayarlari_yukle()
-    guild_key = str(guild_id)
-    if guild_key not in ayarlar:
-        ayarlar[guild_key] = {}
-    ayarlar[guild_key][tur] = kanal_id
-    ayarlari_kaydet(ayarlar)
+    with _ayar_dosya_kilidi:
+        ayarlar = ayarlari_yukle()
+        guild_key = str(guild_id)
+        if guild_key not in ayarlar:
+            ayarlar[guild_key] = {}
+        ayarlar[guild_key][tur] = kanal_id
+        ayarlari_kaydet(ayarlar)
 
 
 def kanal_sil(guild_id: int, tur: str):
     """Bir log türünün kanal kaydını siler (devre dışı bırakır)."""
-    ayarlar = ayarlari_yukle()
-    guild_key = str(guild_id)
-    if guild_key in ayarlar and tur in ayarlar[guild_key]:
-        del ayarlar[guild_key][tur]
-        ayarlari_kaydet(ayarlar)
+    with _ayar_dosya_kilidi:
+        ayarlar = ayarlari_yukle()
+        guild_key = str(guild_id)
+        if guild_key in ayarlar and tur in ayarlar[guild_key]:
+            del ayarlar[guild_key][tur]
+            ayarlari_kaydet(ayarlar)
 
 
 def guild_ayarlari_sil(guild_id: int):
     """Bir sunucunun tüm log ayarlarını tamamen siler."""
-    ayarlar = ayarlari_yukle()
-    guild_key = str(guild_id)
-    if guild_key in ayarlar:
-        del ayarlar[guild_key]
-        ayarlari_kaydet(ayarlar)
+    with _ayar_dosya_kilidi:
+        ayarlar = ayarlari_yukle()
+        guild_key = str(guild_id)
+        if guild_key in ayarlar:
+            del ayarlar[guild_key]
+            ayarlari_kaydet(ayarlar)
 
 
 # ─────────────────────────────────────────
@@ -210,10 +530,40 @@ PREFIX = os.environ.get("BOT_PREFIX", ".")
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, case_insensitive=True, help_command=None)
 
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
-        return  # Bilinmeyen komutları sessizce geç
+
+class PrefixMesajCiftKopya(commands.CheckFailure):
+    """Aynı Discord mesajı için başka bir bot süreci prefix komutunu zaten işledi."""
+
+
+@bot.check
+async def prefix_komut_mesaj_kilidi(ctx: commands.Context):
+    """Opsiyonel dagitik kilit: PREFIX_CMD_LOCK=1 (cift bot) — varsayilan kapali, hiz icin."""
+    if ctx.message is None:
+        return True
+    if not _prefix_dagitik_kilit_istiyor_mu():
+        return True
+    if not mongo_aktif_mi() and not _upstash_kilit_env_var_mi():
+        return True
+    cid = ctx.message.channel.id if ctx.message.channel else 0
+    if await _prefix_mesaj_kilidi_dene(cid, ctx.message.id):
+        return True
+    raise PrefixMesajCiftKopya()
+
+
+async def _prefix_komutlari_isle(message: discord.Message):
+    """
+    Ayni Discord mesaji icin process_commands yalnizca bir kez calisir.
+    Cift yanit (kayitli + bos) sorununu genelde bu tur cift cagri olusturur.
+    """
+    if not hasattr(bot, "_prefix_islenen_mesaj_ids"):
+        bot._prefix_islenen_mesaj_ids = set()
+    mid = message.id
+    if mid in bot._prefix_islenen_mesaj_ids:
+        return
+    bot._prefix_islenen_mesaj_ids.add(mid)
+    if len(bot._prefix_islenen_mesaj_ids) > 4000:
+        bot._prefix_islenen_mesaj_ids = set(list(bot._prefix_islenen_mesaj_ids)[-2000:])
+    await bot.process_commands(message)
 
 
 # ─────────────────────────────────────────
@@ -266,7 +616,8 @@ class TicketControlView(discord.ui.View):
 
         ayar = ticket_ayar_al(interaction.guild_id)
         log_id = ayar.get("log")
-        if log_id:
+        await _ticket_kapat_logu_ve_transkript(channel, interaction.user, log_id)
+        if False and log_id:
             log_kanali = interaction.guild.get_channel(log_id)
             if log_kanali:
                 await log_kanali.send(embed=discord.Embed(
@@ -877,6 +1228,15 @@ async def on_voice_state_update(member: discord.Member, onceki: discord.VoiceSta
     if onceki.channel == sonraki.channel:
         return  # Mute/deafen gibi değişiklikleri loglama
 
+    anahtar = (member.guild.id, member.id)
+    simdi_ts = time.time()
+    baslangic = _SES_OTURUMLARI.get(anahtar)
+    if onceki.channel is not None and baslangic is not None:
+        _profil_bekleyen_arttir(member.guild.id, member.id, ses_delta=max(0, int(simdi_ts - baslangic)))
+        _SES_OTURUMLARI.pop(anahtar, None)
+    if sonraki.channel is not None:
+        _SES_OTURUMLARI[anahtar] = simdi_ts
+
     embed = discord.Embed(color=RENKLER["ses"], timestamp=datetime.now(timezone.utc))
     embed.add_field(name="👤 Üye", value=f"{member.mention} `{member}`", inline=False)
 
@@ -1256,6 +1616,8 @@ async def on_command_error(ctx, error):
     """CommandNotFound ve diğer bilinen hataları sessizce geçer."""
     if isinstance(error, commands.CommandNotFound):
         return  # Bilinmeyen komutları yoksay
+    if isinstance(error, PrefixMesajCiftKopya):
+        return  # Çift bot süreci: ikinci kopya sessizce yoksayılır
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ Bu komutu kullanmak için yetkin yok.")
     elif isinstance(error, commands.MemberNotFound):
@@ -1281,26 +1643,31 @@ async def on_ready():
         bot.add_view(TicketControlView())
         bot._persistent_views_registered = True
 
+    if mongo_aktif_mi() and not getattr(bot, "_prefix_lock_index_ok", False):
+        await asyncio.to_thread(_prefix_lock_ttl_index_olustur)
+        bot._prefix_lock_index_ok = True
+
     for guild in bot.guilds:
-        ayarlar = ayarlari_yukle()
-        gk = str(guild.id)
-        if gk not in ayarlar:
-            ayarlar[gk] = {}
-        # Log kanallarını yükle
-        for tur, kanal_id in DEFAULT_LOG_KANALLARI.items():
-            ayarlar[gk].setdefault(tur, kanal_id)
-        # Partner kanallarını yükle
-        if DEFAULT_PARTNER_TEXT_KANALI:
-            ayarlar[gk].setdefault("partner_kanal", DEFAULT_PARTNER_TEXT_KANALI)
-        if DEFAULT_PARTNER_LOG_KANALI:
-            ayarlar[gk].setdefault("partner_log", DEFAULT_PARTNER_LOG_KANALI)
-        ayarlari_kaydet(ayarlar)
+        def _guncelle(ayarlar):
+            gk = str(guild.id)
+            if gk not in ayarlar:
+                ayarlar[gk] = {}
+            for tur, kanal_id in DEFAULT_LOG_KANALLARI.items():
+                if guild.get_channel(kanal_id):
+                    ayarlar[gk].setdefault(tur, kanal_id)
+            if DEFAULT_PARTNER_TEXT_KANALI and guild.get_channel(DEFAULT_PARTNER_TEXT_KANALI):
+                ayarlar[gk].setdefault("partner_kanal", DEFAULT_PARTNER_TEXT_KANALI)
+            if DEFAULT_PARTNER_LOG_KANALI and guild.get_channel(DEFAULT_PARTNER_LOG_KANALI):
+                ayarlar[gk].setdefault("partner_log", DEFAULT_PARTNER_LOG_KANALI)
+
+        ayarlari_guncelle(_guncelle)
     print("  ✅ Kanallar yüklendi.")
 
     print("━" * 52)
     print(f"  🤖 Bot    : {bot.user} ({bot.user.id})")
+    print(f"  🖥️  Surec  : {' | '.join(_bot_surec_log_satirlari())}")
     print(f"  📡 Sunucu : {len(bot.guilds)} adet")
-    print(f"  ⚙️  Ayarlar: {AYAR_DOSYASI}")
+    print(f"  ⚙️  Ayarlar: Supabase={'acik' if supabase_aktif_mi() else 'kapali'} | DosyaFallback={AYAR_DOSYASI}")
     print("━" * 52)
     print("  Kullanılabilir slash komutları:")
     print("    /log-kur <tür> <kanal>  → Kanal ata")
@@ -1315,6 +1682,14 @@ async def on_ready():
             name="sunucu loglarını 👁️"
         )
     )
+
+    if not getattr(bot, "_coklu_surec_izleme_baslatildi", False):
+        bot._coklu_surec_izleme_baslatildi = True
+        asyncio.create_task(_bot_coklu_surec_izleme_dongusu())
+    if not getattr(bot, "_profil_kaydetme_dongusu_baslatildi", False):
+        bot._profil_kaydetme_dongusu_baslatildi = True
+        asyncio.create_task(_profil_bekleyenleri_kaydet_dongusu())
+
 
 # ═══════════════════════════════════════════════════════════════
 #  PARTNER SİSTEMİ
@@ -1349,24 +1724,26 @@ def partner_verisi_al(guild_id: int) -> dict:
 
 def partner_kaydet_db(guild_id: int, hedef_guild_id: int, veri: dict):
     """Bir partner kaydını settings.json'a yazar."""
-    ayarlar = ayarlari_yukle()
-    guild_key = str(guild_id)
-    if guild_key not in ayarlar:
-        ayarlar[guild_key] = {}
-    if "partners" not in ayarlar[guild_key]:
-        ayarlar[guild_key]["partners"] = {}
-    ayarlar[guild_key]["partners"][str(hedef_guild_id)] = veri
-    ayarlari_kaydet(ayarlar)
+    def _guncelle(ayarlar):
+        guild_key = str(guild_id)
+        if guild_key not in ayarlar:
+            ayarlar[guild_key] = {}
+        if "partners" not in ayarlar[guild_key]:
+            ayarlar[guild_key]["partners"] = {}
+        ayarlar[guild_key]["partners"][str(hedef_guild_id)] = veri
+
+    ayarlari_guncelle(_guncelle)
 
 
 def partner_log_kanali_kaydet(guild_id: int, kanal_id: int):
     """Partner log kanalını kaydeder."""
-    ayarlar = ayarlari_yukle()
-    guild_key = str(guild_id)
-    if guild_key not in ayarlar:
-        ayarlar[guild_key] = {}
-    ayarlar[guild_key]["partner_log"] = kanal_id
-    ayarlari_kaydet(ayarlar)
+    def _guncelle(ayarlar):
+        guild_key = str(guild_id)
+        if guild_key not in ayarlar:
+            ayarlar[guild_key] = {}
+        ayarlar[guild_key]["partner_log"] = kanal_id
+
+    ayarlari_guncelle(_guncelle)
 
 
 def partner_log_kanali_al(guild_id: int):
@@ -1449,11 +1826,13 @@ def partner_log_kanali_al_v2(guild_id: int):
 
 def partner_kanal_id_kaydet(guild_id: int, kanal_id: int):
     """Partner text kanalını kaydeder."""
-    ayarlar = ayarlari_yukle()
-    gk = str(guild_id)
-    if gk not in ayarlar: ayarlar[gk] = {}
-    ayarlar[gk]["partner_kanal"] = kanal_id
-    ayarlari_kaydet(ayarlar)
+    def _guncelle(ayarlar):
+        gk = str(guild_id)
+        if gk not in ayarlar:
+            ayarlar[gk] = {}
+        ayarlar[gk]["partner_kanal"] = kanal_id
+
+    ayarlari_guncelle(_guncelle)
 
 def yetkili_partner_sayisi_guncelle(guild_id: int, yetkili_id: int, yetkili_adi: str):
     """
@@ -1461,16 +1840,19 @@ def yetkili_partner_sayisi_guncelle(guild_id: int, yetkili_id: int, yetkili_adi:
     Her partnerlik yapıldığında ilgili yetkilinin sayısını 1 artırır.
     Yapı: ayarlar[guild_id]["yetkili_partnerleri"][yetkili_id] = {"ad": ..., "sayi": ...}
     """
-    ayarlar = ayarlari_yukle()
-    gk = str(guild_id)
-    yk = str(yetkili_id)
-    if gk not in ayarlar: ayarlar[gk] = {}
-    if "yetkili_partnerleri" not in ayarlar[gk]: ayarlar[gk]["yetkili_partnerleri"] = {}
-    if yk not in ayarlar[gk]["yetkili_partnerleri"]:
-        ayarlar[gk]["yetkili_partnerleri"][yk] = {"ad": yetkili_adi, "sayi": 0}
-    ayarlar[gk]["yetkili_partnerleri"][yk]["sayi"] += 1
-    ayarlar[gk]["yetkili_partnerleri"][yk]["ad"] = yetkili_adi  # güncel isim
-    ayarlari_kaydet(ayarlar)
+    def _guncelle(ayarlar):
+        gk = str(guild_id)
+        yk = str(yetkili_id)
+        if gk not in ayarlar:
+            ayarlar[gk] = {}
+        if "yetkili_partnerleri" not in ayarlar[gk]:
+            ayarlar[gk]["yetkili_partnerleri"] = {}
+        if yk not in ayarlar[gk]["yetkili_partnerleri"]:
+            ayarlar[gk]["yetkili_partnerleri"][yk] = {"ad": yetkili_adi, "sayi": 0}
+        ayarlar[gk]["yetkili_partnerleri"][yk]["sayi"] += 1
+        ayarlar[gk]["yetkili_partnerleri"][yk]["ad"] = yetkili_adi
+
+    ayarlari_guncelle(_guncelle)
 
 def yetkili_siralamasi_al(guild_id: int) -> list:
     """
@@ -1899,8 +2281,8 @@ async def mute(ctx, uye: discord.Member, *, arguman: str = ""):
         sure_goster = "Süresiz"
         sebep = arguman.strip() if arguman.strip() else "Sebep belirtilmedi"
 
-    bitis = datetime.now(timezone.utc) + discord.utils.timedelta(seconds=saniye)
-    await uye.timeout(discord.utils.timedelta(seconds=saniye), reason=f"{ctx.author}: {sebep}")
+    bitis = datetime.now(timezone.utc) + timedelta(seconds=saniye)
+    await uye.timeout(timedelta(seconds=saniye), reason=f"{ctx.author}: {sebep}")
 
     embed = mod_embed("🔇 Üye Susturuldu", RENKLER["mute"],
         **{"👤 Üye": f"{uye.mention} `{uye}`",
@@ -2135,7 +2517,9 @@ async def gelismis_yardim(ctx):
         e.add_field(name="Ticket - Ozellikler", value="`.ticketkonu [konu]` ┗ Konu ayarlar\n`.ticketlist` ┗ Acik ticketlari listeler\n`.ticketsayi` ┗ Toplam ticket sayisi\n`.ticketoncelik [dusuk/orta/yuksek]` ┗ Oncelik belirler\n`.ticketsahip @uye` ┗ Sahibi degistirir\n`.ticketyeniden @uye` ┗ Yeniden acar", inline=False)
         e.add_field(name="Anti-Link", value="`.antilink` ┗ Durum gosterir\n`.antilink ac` ┗ Acar\n`.antilink kapat` ┗ Kapatir\n`.antilink muaf @rol/#kanal` ┗ Muafiyet ekler/kaldirir", inline=False)
         e.add_field(name="Renk Sistemi", value="`.renkekle @rol` ┗ Menuye rol ekler\n`.renkcikar @rol` ┗ Menuden rol cikarir\n`.renklist` ┗ Listedeki rolleri gosterir\n`.renkpanel` ┗ Secim paneli gonderir", inline=False)
-        e.add_field(name="Log Sistemi", value="`.logkur` ┗ Otomatik kanal tarar\n`/log-kur` · `/log-kaldir` · `/log-durum` · `/log-sifirla`", inline=False)
+        e.add_field(name="Log Sistemi", value="`.logkur` ┗ Otomatik kanal tarar\n`.logkurkanal` ┗ Eksik log kanallarini olusturur\n`/log-kur` · `/log-kaldir` · `/log-durum` · `/log-sifirla`", inline=False)
+        e.add_field(name="Level Sistemi", value="`.levelkur` ┗ Modal ile kurulum\n`.levelrol <seviye> @rol` ┗ Rol odulu ekler\n`.levelrolsil <seviye>` ┗ Rol odulunu siler\n`.levelrolleri` ┗ Odulleri listeler\n`.levelmesajtest [@uye]`\n`.leveldurum` · `.seviye [@uye]`", inline=False)
+        e.add_field(name="Hosgeldin Sistemi", value="`.hosgeldinkur` ┗ Modal ile kurulum\n`.hosgeldindurum` ┗ Ayarlari gosterir\n`.hosgeldinmesajtest [@uye]`", inline=False)
         return e
 
     class HelpView(discord.ui.View):
@@ -2165,9 +2549,168 @@ async def gelismis_yardim(ctx):
     await ctx.send(embed=ana_embed(), view=HelpView())
 
 
+async def gelismis_yardim_v2(ctx):
+    def ana_embed():
+        e = discord.Embed(
+            title="Komut Rehberi",
+            description="Butonlardan bir kategori secip komutlari temiz bir duzende gezebilirsin.",
+            color=0x5865F2,
+            timestamp=datetime.now(timezone.utc)
+        )
+        e.add_field(name="Kategoriler", value="Moderasyon\nPartner\nEglence\nAraclar", inline=False)
+        e.add_field(name="Hizli Baslangic", value="`.profil` • `.ticketpanel` • `.levelkur` • `.hosgeldinkur`", inline=False)
+        e.set_footer(text=f"{ctx.guild.name} • Yardim Menusu")
+        if ctx.guild.icon:
+            e.set_thumbnail(url=ctx.guild.icon.url)
+        return e
+
+    def mod_embed():
+        e = discord.Embed(title="Moderasyon", description="Ceza, kanal ve mesaj yonetimi.", color=0xE74C3C, timestamp=datetime.now(timezone.utc))
+        e.add_field(name="Uye Islemleri", value="`.ban @uye [sebep]`\n`.unban <id> [sebep]`\n`.kick @uye [sebep]`\n`.mute @uye [sure] [sebep]`\n`.unmute @uye`", inline=False)
+        e.add_field(name="Kanal & Mesaj", value="`.sil [adet]`\n`.slowmode [sn]`\n`.duyuru #kanal mesaj`", inline=False)
+        e.add_field(name="Uyari", value="`.warn @uye [sebep]`\n`.uyarilar @uye`\n`.uyarisil @uye`\nMesaja yanit verip `.ban`, `.kick`, `.warn` de kullanabilirsin.", inline=False)
+        return e
+
+    def partner_embed():
+        e = discord.Embed(title="Partner Sistemi", description="Partner kaydi, takip ve siralama komutlari.", color=0x57F287, timestamp=datetime.now(timezone.utc))
+        e.add_field(name="Kurulum", value="`.partner-kur #text #log`", inline=False)
+        e.add_field(name="Takip", value="`.partner-istatistik`\n`.partner-top`\n`.partner-liste`\n`.partner-sifirla`", inline=False)
+        e.add_field(name="Calisma Mantigi", value="Partner kanala gecerli davet linki atilir.\nBot kaydi tutar ve ayni sunucu icin 1 saat bekleme uygular.", inline=False)
+        return e
+
+    def eglence_embed():
+        e = discord.Embed(title="Eglence & Bilgi", description="Cekilis, AFK ve profil komutlari.", color=0xF1C40F, timestamp=datetime.now(timezone.utc))
+        e.add_field(name="Cekilis", value="`.cekilisbaslat [sure] [kisi] [odul]`\n`.cekilisbitir <id>`\n`.cekilisyenile <id> [kisi]`\n`.cekiliskatilimci <id>`\n`.cekilisbilgi <id>`\n`.cekilissil <id>`", inline=False)
+        e.add_field(name="AFK", value="`.afk [sebep]`\nMesaj atinca otomatik kapanir\nEtiketlenen AFK uyeler bildirilir", inline=False)
+        e.add_field(name="Bilgi", value="`.sunucu`\n`.profil [@uye]`", inline=False)
+        return e
+
+    def araclar_embed():
+        e = discord.Embed(title="Araclar & Sistemler", description="Kurulum ve sistem komutlari tek yerde.", color=0x9B59B6, timestamp=datetime.now(timezone.utc))
+        e.add_field(name="Ticket", value="`.ticketkur [kategori] #log @rol`\n`.ticketpanel`\n`.ticketkapat` · `.ticketekle` · `.ticketcikar`\n`.ticketkonu` · `.ticketlist` · `.ticketsayi`\n`.ticketoncelik` · `.ticketsahip` · `.ticketyeniden`", inline=False)
+        e.add_field(name="Log", value="`.logkur`\n`.logkurkanal`\n`/log-kur` · `/log-kaldir`\n`/log-durum` · `/log-sifirla`", inline=False)
+        e.add_field(name="Level", value="`.levelkur`\n`.levelrol <seviye> @rol`\n`.levelrolsil <seviye>`\n`.levelrolleri`\n`.levelmesajtest [@uye]`\n`.leveldurum` · `.seviye [@uye]`", inline=False)
+        e.add_field(name="Hosgeldin", value="`.hosgeldinkur`\n`.hosgeldindurum`\n`.hosgeldinmesajtest [@uye]`", inline=False)
+        e.add_field(name="Diger", value="`.antilink`\n`.antilink ac`\n`.antilink kapat`\n`.antilink muaf @rol/#kanal`\n`.renkekle @rol` · `.renkcikar @rol`\n`.renklist` · `.renkpanel`", inline=False)
+        e.set_footer(text="Modal ile kurulan sistemlerde eski setter komutlari kaldirildi")
+        return e
+
+    class HelpView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=120)
+
+        @discord.ui.button(label="Moderasyon", style=discord.ButtonStyle.danger)
+        async def btn_mod(self, i: discord.Interaction, b: discord.ui.Button):
+            await i.response.edit_message(embed=mod_embed(), view=self)
+
+        @discord.ui.button(label="Partner", style=discord.ButtonStyle.success)
+        async def btn_partner(self, i: discord.Interaction, b: discord.ui.Button):
+            await i.response.edit_message(embed=partner_embed(), view=self)
+
+        @discord.ui.button(label="Eglence", style=discord.ButtonStyle.primary)
+        async def btn_eglence(self, i: discord.Interaction, b: discord.ui.Button):
+            await i.response.edit_message(embed=eglence_embed(), view=self)
+
+        @discord.ui.button(label="Araclar", style=discord.ButtonStyle.secondary)
+        async def btn_araclar(self, i: discord.Interaction, b: discord.ui.Button):
+            await i.response.edit_message(embed=araclar_embed(), view=self)
+
+        @discord.ui.button(label="Ana Menu", style=discord.ButtonStyle.secondary, row=1)
+        async def btn_ana(self, i: discord.Interaction, b: discord.ui.Button):
+            await i.response.edit_message(embed=ana_embed(), view=self)
+
+    await ctx.send(embed=ana_embed(), view=HelpView())
+
+
+async def gelismis_yardim_v3(ctx):
+    def embed_taban(title: str, description: str, color: int) -> discord.Embed:
+        e = discord.Embed(
+            title=title,
+            description=description,
+            color=color,
+            timestamp=datetime.now(timezone.utc)
+        )
+        if ctx.guild.icon:
+            e.set_thumbnail(url=ctx.guild.icon.url)
+        e.set_footer(text=f"{ctx.guild.name} • {zaman_damgasi()}")
+        return e
+
+    def ana_embed():
+        e = embed_taban(
+            "Komut Rehberi",
+            "Butonlardan bir kategori sec. Her sayfa daha sade, hizli ve okunakli olacak sekilde duzenlendi.",
+            0x5865F2,
+        )
+        e.add_field(name="Kategoriler", value="`Moderasyon`\n`Partner`\n`Eglence`\n`Araclar`", inline=True)
+        e.add_field(name="Hizli Baslangic", value="`.profil`\n`.ticketpanel`\n`.levelkur`\n`.hosgeldinkur`", inline=True)
+        e.add_field(name="Kisa Not", value="Modal ile kurulan sistemlerde eski ayar komutlari kaldirildi.", inline=False)
+        return e
+
+    def mod_embed():
+        e = embed_taban("Moderasyon", "Ceza, kanal ve mesaj yonetimi burada toplanir.", 0xE74C3C)
+        e.add_field(name="Uye Islemleri", value="`.ban @uye [sebep]`\n`.unban <id> [sebep]`\n`.kick @uye [sebep]`\n`.mute @uye [sure] [sebep]`\n`.unmute @uye`", inline=False)
+        e.add_field(name="Kanal ve Mesaj", value="`.sil [adet]`\n`.slowmode [sn]`\n`.duyuru #kanal mesaj`", inline=False)
+        e.add_field(name="Uyari Takibi", value="`.warn @uye [sebep]`\n`.uyarilar @uye`\n`.uyarisil @uye`\nMesaja yanit verip `.ban`, `.kick`, `.warn` da kullanabilirsin.", inline=False)
+        return e
+
+    def partner_embed():
+        e = embed_taban("Partner Sistemi", "Partner kaydi, takip ve siralama komutlari.", 0x57F287)
+        e.add_field(name="Kurulum", value="`.partner-kur #text #log`", inline=False)
+        e.add_field(name="Takip ve Rapor", value="`.partner-istatistik`\n`.partner-top`\n`.partner-liste`\n`.partner-sifirla`", inline=False)
+        e.add_field(name="Calisma Mantigi", value="Partner kanalina gecerli davet linki atilir.\nBot kaydi tutar ve ayni sunucu icin 1 saat bekleme uygular.", inline=False)
+        return e
+
+    def eglence_embed():
+        e = embed_taban("Eglence ve Bilgi", "Cekilis, AFK ve profil komutlari.", 0xF1C40F)
+        e.add_field(name="Cekilis", value="`.cekilisbaslat [sure] [kisi] [odul]`\n`.cekilisbitir <id>`\n`.cekilisyenile <id> [kisi]`\n`.cekiliskatilimci <id>`\n`.cekilisbilgi <id>`\n`.cekilissil <id>`", inline=False)
+        e.add_field(name="AFK", value="`.afk [sebep]`\nMesaj atinca otomatik kapanir.\nEtiketlenen AFK uyeler bildirilir.", inline=False)
+        e.add_field(name="Bilgi", value="`.sunucu`\n`.profil [@uye]`", inline=False)
+        return e
+
+    def araclar_embed():
+        e = embed_taban("Araclar ve Sistemler", "Kurulum ve sunucu sistemleri tek yerde.", 0x9B59B6)
+        e.add_field(name="Ticket", value="`.ticketkur [kategori] #log @rol`\n`.ticketpanel`\n`.ticketkapat` • `.ticketekle` • `.ticketcikar`\n`.ticketkonu` • `.ticketlist` • `.ticketsayi`\n`.ticketoncelik` • `.ticketsahip` • `.ticketyeniden`", inline=False)
+        e.add_field(name="Log", value="`.logkur`\n`.logkurkanal`\n`/log-kur` • `/log-kaldir`\n`/log-durum` • `/log-sifirla`", inline=False)
+        e.add_field(name="Level", value="`.levelkur`\n`.levelrol <seviye> @rol`\n`.levelrolsil <seviye>`\n`.levelrolleri`\n`.levelmesajtest [@uye]`\n`.leveldurum` • `.seviye [@uye]`", inline=False)
+        e.add_field(name="Hosgeldin", value="`.hosgeldinkur`\n`.hosgeldindurum`\n`.hosgeldinmesajtest [@uye]`", inline=False)
+        e.add_field(name="Diger Sistemler", value="`.antilink`\n`.antilink ac`\n`.antilink kapat`\n`.antilink muaf @rol/#kanal`\n`.renkekle @rol` • `.renkcikar @rol`\n`.renklist` • `.renkpanel`", inline=False)
+        return e
+
+    class HelpView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=120)
+
+        @discord.ui.button(label="Moderasyon", style=discord.ButtonStyle.danger)
+        async def btn_mod(self, i: discord.Interaction, b: discord.ui.Button):
+            await i.response.edit_message(embed=mod_embed(), view=self)
+
+        @discord.ui.button(label="Partner", style=discord.ButtonStyle.success)
+        async def btn_partner(self, i: discord.Interaction, b: discord.ui.Button):
+            await i.response.edit_message(embed=partner_embed(), view=self)
+
+        @discord.ui.button(label="Eglence", style=discord.ButtonStyle.primary)
+        async def btn_eglence(self, i: discord.Interaction, b: discord.ui.Button):
+            await i.response.edit_message(embed=eglence_embed(), view=self)
+
+        @discord.ui.button(label="Araclar", style=discord.ButtonStyle.secondary)
+        async def btn_araclar(self, i: discord.Interaction, b: discord.ui.Button):
+            await i.response.edit_message(embed=araclar_embed(), view=self)
+
+        @discord.ui.button(label="Ana Menu", style=discord.ButtonStyle.secondary, row=1)
+        async def btn_ana(self, i: discord.Interaction, b: discord.ui.Button):
+            await i.response.edit_message(embed=ana_embed(), view=self)
+
+    await ctx.send(embed=ana_embed(), view=HelpView())
+
+
 @bot.command(name="yardım", aliases=["yardim", "help"])
 async def yardim(ctx):
-    await gelismis_yardim(ctx)
+    if not hasattr(bot, "_help_seen_message_ids"):
+        bot._help_seen_message_ids = set()
+    if ctx.message.id in bot._help_seen_message_ids:
+        return
+    bot._help_seen_message_ids.add(ctx.message.id)
+    await gelismis_yardim_v3(ctx)
     return
 
     def ana_embed():
@@ -2201,7 +2744,9 @@ async def yardim(ctx):
         e = discord.Embed(title="🔧 Araçlar & Sistemler", color=0x9B59B6, timestamp=datetime.now(timezone.utc))
         e.add_field(name="Ticket", value="`.ticketkur [kategori] #log @rol` ┗ Kurar\n`.ticketpanel` ┗ Panel gönderir", inline=False)
         e.add_field(name="Anti-Link", value="`.antilink` ┗ Durum\n`.antilink ac` ┗ Açar\n`.antilink kapat` ┗ Kapatır\n`.antilink muaf @rol/#kanal` ┗ Muafiyet", inline=False)
-        e.add_field(name="Log Sistemi (Slash)", value="`/log-kur` · `/log-kaldir` · `/log-durum` · `/log-sifirla`", inline=False)
+        e.add_field(name="Log Sistemi", value="`.logkur` · `.logkurkanal`\n`/log-kur` · `/log-kaldir` · `/log-durum` · `/log-sifirla`", inline=False)
+        e.add_field(name="Level Sistemi", value="`.levelkur` · `.levelrol` · `.levelrolsil` · `.levelrolleri`\n`.levelmesajtest` · `.leveldurum` · `.seviye`", inline=False)
+        e.add_field(name="Hosgeldin Sistemi", value="`.hosgeldinkur` · `.hosgeldindurum` · `.hosgeldinmesajtest`", inline=False)
         return e
 
     class HelpView(discord.ui.View):
@@ -2244,19 +2789,23 @@ LINK_REGEX = re.compile(r'https?://\S+|discord\.gg/\S+|www\.\S+', re.IGNORECASE)
 # ── AFK yardımcı fonksiyonlar ────────────────────────────────────
 
 def afk_kaydet(guild_id: int, user_id: int, sebep: str):
-    ayarlar = ayarlari_yukle()
-    gk, uk = str(guild_id), str(user_id)
-    if gk not in ayarlar: ayarlar[gk] = {}
-    if "afk" not in ayarlar[gk]: ayarlar[gk]["afk"] = {}
-    ayarlar[gk]["afk"][uk] = {"sebep": sebep, "zaman": datetime.now(timezone.utc).isoformat()}
-    ayarlari_kaydet(ayarlar)
+    def _guncelle(ayarlar):
+        gk, uk = str(guild_id), str(user_id)
+        if gk not in ayarlar:
+            ayarlar[gk] = {}
+        if "afk" not in ayarlar[gk]:
+            ayarlar[gk]["afk"] = {}
+        ayarlar[gk]["afk"][uk] = {"sebep": sebep, "zaman": datetime.now(timezone.utc).isoformat()}
+
+    ayarlari_guncelle(_guncelle)
 
 def afk_sil(guild_id: int, user_id: int):
-    ayarlar = ayarlari_yukle()
-    gk, uk = str(guild_id), str(user_id)
-    if gk in ayarlar and "afk" in ayarlar[gk] and uk in ayarlar[gk]["afk"]:
-        del ayarlar[gk]["afk"][uk]
-        ayarlari_kaydet(ayarlar)
+    def _guncelle(ayarlar):
+        gk, uk = str(guild_id), str(user_id)
+        if gk in ayarlar and "afk" in ayarlar[gk] and uk in ayarlar[gk]["afk"]:
+            del ayarlar[gk]["afk"][uk]
+
+    ayarlari_guncelle(_guncelle)
 
 def afk_al(guild_id: int, user_id: int):
     return ayarlari_yukle().get(str(guild_id), {}).get("afk", {}).get(str(user_id))
@@ -2267,11 +2816,13 @@ def antilink_durum_al(guild_id: int) -> dict:
     return ayarlari_yukle().get(str(guild_id), {}).get("antilink", {"aktif": False, "muaf_roller": [], "muaf_kanallar": []})
 
 def antilink_kaydet(guild_id: int, veri: dict):
-    ayarlar = ayarlari_yukle()
-    gk = str(guild_id)
-    if gk not in ayarlar: ayarlar[gk] = {}
-    ayarlar[gk]["antilink"] = veri
-    ayarlari_kaydet(ayarlar)
+    def _guncelle(ayarlar):
+        gk = str(guild_id)
+        if gk not in ayarlar:
+            ayarlar[gk] = {}
+        ayarlar[gk]["antilink"] = veri
+
+    ayarlari_guncelle(_guncelle)
 
 # ─────────────────────────────────────────
 #  PARTNER KANALI — MESAJ KONTROLÜ
@@ -2286,7 +2837,7 @@ async def on_message(message: discord.Message):
     Partner kanalı mesaj kontrolü + AFK + Anti-link + prefix komutları
     """
     if message.author.bot:
-        await bot.process_commands(message)
+        await _prefix_komutlari_isle(message)
         return
 
     if message.guild:
@@ -2357,12 +2908,7 @@ async def on_message(message: discord.Message):
                 "zaman":       simdi.isoformat(),
                 "son_partner": simdi.isoformat()
             }
-            ayarlar = ayarlari_yukle()
-            gk = str(message.guild.id)
-            if gk not in ayarlar: ayarlar[gk] = {}
-            if "partners" not in ayarlar[gk]: ayarlar[gk]["partners"] = {}
-            ayarlar[gk]["partners"][davet_kodu] = kayit
-            ayarlari_kaydet(ayarlar)
+            partner_kaydet_db(message.guild.id, davet_kodu, kayit)
 
             yetkili_partner_sayisi_guncelle(message.guild.id, message.author.id, str(message.author))
 
@@ -2464,7 +3010,7 @@ async def on_message(message: discord.Message):
                         pass
                     return
 
-    await bot.process_commands(message)
+    await _prefix_komutlari_isle(message)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2579,7 +3125,7 @@ async def cekilisbaslat(ctx, sure: str = None, kazanan: int = 1, *, odul: str = 
         saniye = int(sure[:-1]) * birimler[sure[-1]]
     except (ValueError, KeyError, IndexError):
         await ctx.send("❌ Geçersiz süre. Örnek: `10s`, `5m`, `2h`, `1d`"); return
-    bitis = datetime.now(timezone.utc) + discord.utils.timedelta(seconds=saniye)
+    bitis = datetime.now(timezone.utc) + timedelta(seconds=saniye)
     embed = discord.Embed(
         title=f"🎉 ÇEKİLİŞ — {odul}",
         description=f"Katılmak için 🎉 tepkisini ver!\n\n**⏰ Bitiş:** {bitis.strftime('%d.%m.%Y %H:%M UTC')}\n**🏆 Kazanan:** {kazanan} kişi\n**🎁 Ödül:** {odul}",
@@ -2736,21 +3282,126 @@ def ticket_ayar_al(guild_id: int) -> dict:
     return ayarlari_yukle().get(str(guild_id), {}).get("ticket", {})
 
 def ticket_ayar_kaydet(guild_id: int, veri: dict):
-    ayarlar = ayarlari_yukle()
-    gk = str(guild_id)
-    if gk not in ayarlar: ayarlar[gk] = {}
-    ayarlar[gk]["ticket"] = veri
-    ayarlari_kaydet(ayarlar)
+    def _guncelle(ayarlar):
+        gk = str(guild_id)
+        if gk not in ayarlar:
+            ayarlar[gk] = {}
+        ayarlar[gk]["ticket"] = veri
+
+    ayarlari_guncelle(_guncelle)
 
 def ticket_sayaci_artir(guild_id: int) -> int:
-    ayarlar = ayarlari_yukle()
-    gk = str(guild_id)
-    if gk not in ayarlar: ayarlar[gk] = {}
-    if "ticket" not in ayarlar[gk]: ayarlar[gk]["ticket"] = {}
-    ayarlar[gk]["ticket"]["sayac"] = ayarlar[gk]["ticket"].get("sayac", 0) + 1
-    sayi = ayarlar[gk]["ticket"]["sayac"]
-    ayarlari_kaydet(ayarlar)
-    return sayi
+    def _guncelle(ayarlar):
+        gk = str(guild_id)
+        if gk not in ayarlar:
+            ayarlar[gk] = {}
+        if "ticket" not in ayarlar[gk]:
+            ayarlar[gk]["ticket"] = {}
+        ayarlar[gk]["ticket"]["sayac"] = ayarlar[gk]["ticket"].get("sayac", 0) + 1
+        return ayarlar[gk]["ticket"]["sayac"]
+
+    return ayarlari_guncelle(_guncelle)
+
+
+def _ticket_sahip_id_kanaldan_al(channel: discord.TextChannel) -> int | None:
+    topic = channel.topic or ""
+    if " | ID: " not in topic:
+        return None
+    try:
+        kalan = topic.split(" | ID: ", 1)[1]
+        return int(kalan.split(" | ", 1)[0].strip())
+    except (ValueError, IndexError):
+        return None
+
+
+async def _ticket_transkript_html_olustur(channel: discord.TextChannel) -> io.BytesIO:
+    mesajlar = [m async for m in channel.history(limit=None, oldest_first=True)]
+    satirlar = []
+    for mesaj in mesajlar:
+        yazar = html.escape(str(mesaj.author))
+        zaman = mesaj.created_at.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M:%S UTC")
+        icerik = html.escape(mesaj.content or "")
+        icerik_html = icerik.replace("\n", "<br>")
+        ekler = ""
+        if mesaj.attachments:
+            baglantilar = [f'<a href="{html.escape(a.url)}" target="_blank">{html.escape(a.filename)}</a>' for a in mesaj.attachments]
+            ekler = f'<div class="attachments">Ekler: {" • ".join(baglantilar)}</div>'
+        if mesaj.embeds and not icerik:
+            icerik_html = '<span class="muted">[Embed mesaj]</span>'
+        satirlar.append(
+            f"""
+            <article class="message">
+                <div class="avatar"><img src="{html.escape(mesaj.author.display_avatar.url)}" alt="avatar"></div>
+                <div class="body">
+                    <div class="meta"><strong>{yazar}</strong><span>{zaman}</span></div>
+                    <div class="content">{icerik_html or '<span class="muted">[Bos mesaj]</span>'}</div>
+                    {ekler}
+                </div>
+            </article>
+            """
+        )
+    html_icerik = f"""<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <title>{html.escape(channel.name)} transcript</title>
+  <style>
+    :root {{ color-scheme: dark; }}
+    body {{ margin: 0; font-family: Segoe UI, Arial, sans-serif; background: linear-gradient(180deg, #10131a, #0a0d12); color: #eef2ff; }}
+    .wrap {{ max-width: 980px; margin: 0 auto; padding: 32px 20px 60px; }}
+    .hero {{ padding: 24px; border: 1px solid #2b3240; border-radius: 20px; background: rgba(18, 24, 34, 0.92); box-shadow: 0 24px 80px rgba(0,0,0,.35); }}
+    .hero h1 {{ margin: 0 0 6px; font-size: 28px; }}
+    .hero p {{ margin: 0; color: #a9b4c7; }}
+    .messages {{ margin-top: 20px; display: grid; gap: 12px; }}
+    .message {{ display: grid; grid-template-columns: 56px 1fr; gap: 14px; padding: 16px; border-radius: 18px; background: rgba(17, 22, 31, 0.94); border: 1px solid #232b39; }}
+    .avatar img {{ width: 48px; height: 48px; border-radius: 50%; object-fit: cover; }}
+    .meta {{ display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin-bottom: 8px; }}
+    .meta span {{ color: #90a0b8; font-size: 12px; }}
+    .content {{ line-height: 1.6; word-break: break-word; }}
+    .attachments {{ margin-top: 10px; color: #9bc1ff; font-size: 14px; }}
+    .attachments a {{ color: #8ec5ff; text-decoration: none; }}
+    .muted {{ color: #7f8a9b; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>#{html.escape(channel.name)} transcript</h1>
+      <p>{len(mesajlar)} mesaj • {html.escape(channel.guild.name)}</p>
+    </section>
+    <section class="messages">
+      {''.join(satirlar) if satirlar else '<p class="muted">Bu ticketta mesaj bulunamadi.</p>'}
+    </section>
+  </div>
+</body>
+</html>"""
+    buffer = io.BytesIO(html_icerik.encode("utf-8"))
+    buffer.seek(0)
+    return buffer
+
+
+async def _ticket_kapat_logu_ve_transkript(channel: discord.TextChannel, kapatan: discord.abc.User, log_id: int | None):
+    if not log_id:
+        return
+    log_k = channel.guild.get_channel(log_id)
+    if not log_k:
+        return
+    sahip_id = _ticket_sahip_id_kanaldan_al(channel)
+    sahip = channel.guild.get_member(sahip_id) if sahip_id else None
+    transcript = await _ticket_transkript_html_olustur(channel)
+    dosya = discord.File(transcript, filename=f"{channel.name}-transcript.html")
+    e = discord.Embed(
+        title="Ticket Kapatildi",
+        description=(
+            f"**Ticket:** `{channel.name}`\n"
+            f"**Sahip:** {sahip.mention if sahip else 'Bilinmiyor'}\n"
+            f"**Kapatan:** {kapatan.mention}"
+        ),
+        color=RENKLER["hata"],
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.set_footer(text="Transcript ekte gonderildi")
+    await log_k.send(embed=e, file=dosya)
 
 
 @bot.command(name="ticketkur", aliases=["ticket-kur"])
@@ -2826,9 +3477,10 @@ async def ticket_panel(ctx):
 
                 @discord.ui.button(label="🔒 Kapat", style=discord.ButtonStyle.danger, custom_id=f"ticket_kapat_{ticket_kanal.id}")
                 async def kapat(self, i2: discord.Interaction, b: discord.ui.Button):
+                    await _ticket_kapat_logu_ve_transkript(ticket_kanal, i2.user, log_id)
                     await i2.response.send_message("Ticket kapatılıyor...", ephemeral=True)
 
-                    if log_id:
+                    if False and log_id:
                         log_k = i2.guild.get_channel(log_id)
                         if log_k:
                             await log_k.send(embed=discord.Embed(
@@ -2900,7 +3552,7 @@ async def ticket_panel(ctx):
     panel_embed.set_footer(text=ctx.guild.name)
     if ctx.guild.icon:
         panel_embed.set_thumbnail(url=ctx.guild.icon.url)
-    await ctx.send(embed=panel_embed, view=TicketOpenView())
+    await ctx.send(embed=panel_embed, view=TicketView())
     try: await ctx.message.delete()
     except: pass
 
@@ -2940,8 +3592,9 @@ async def ticket_kapat(ctx):
 
     ayar   = ticket_ayar_al(ctx.guild.id)
     log_id = ayar.get("log")
+    await _ticket_kapat_logu_ve_transkript(ctx.channel, ctx.author, log_id)
 
-    if log_id:
+    if False and log_id:
         log_k = ctx.guild.get_channel(log_id)
         if log_k:
             await log_k.send(embed=discord.Embed(
@@ -3209,6 +3862,688 @@ async def renk_panel(ctx):
 
     embed = discord.Embed(title="Renk Sistemi", description="Asagidan kendine bir renk rolu sec.", color=RENKLER["rol"])
     await ctx.send(embed=embed, view=RenkView())
+
+
+# ═══════════════════════════════════════════════════════════════
+#  LEVEL + HOSGELDIN SISTEMI (EK BLOK)
+# ═══════════════════════════════════════════════════════════════
+
+import random
+
+_LEVEL_XP_COOLDOWN = {}
+_LEVEL_COOLDOWN_SANIYE = 45
+_PROFIL_BEKLEYEN = {}
+_SES_OTURUMLARI = {}
+
+
+def _profil_bekleyen_arttir(guild_id: int, user_id: int, mesaj_delta: int = 0, ses_delta: int = 0):
+    gk, uk = str(guild_id), str(user_id)
+    if gk not in _PROFIL_BEKLEYEN:
+        _PROFIL_BEKLEYEN[gk] = {}
+    if uk not in _PROFIL_BEKLEYEN[gk]:
+        _PROFIL_BEKLEYEN[gk][uk] = {"message_count": 0, "voice_seconds": 0}
+    _PROFIL_BEKLEYEN[gk][uk]["message_count"] += int(mesaj_delta)
+    _PROFIL_BEKLEYEN[gk][uk]["voice_seconds"] += int(ses_delta)
+
+
+def _profil_istat_al(guild_id: int, user_id: int) -> dict:
+    ayarlar = ayarlari_yukle()
+    gk, uk = str(guild_id), str(user_id)
+    veri = ayarlar.get(gk, {}).get("profil_istat", {}).get(uk, {})
+    sonuc = {
+        "message_count": int(veri.get("message_count", 0)),
+        "voice_seconds": int(veri.get("voice_seconds", 0)),
+    }
+    bekleyen = _PROFIL_BEKLEYEN.get(gk, {}).get(uk)
+    if bekleyen:
+        sonuc["message_count"] += int(bekleyen.get("message_count", 0))
+        sonuc["voice_seconds"] += int(bekleyen.get("voice_seconds", 0))
+    aktif_baslangic = _SES_OTURUMLARI.get((guild_id, user_id))
+    if aktif_baslangic is not None:
+        sonuc["voice_seconds"] += max(0, int(time.time() - aktif_baslangic))
+    return sonuc
+
+
+def _profil_bekleyenleri_kaydet():
+    if not _PROFIL_BEKLEYEN:
+        return
+
+    bekleyen = _PROFIL_BEKLEYEN.copy()
+    _PROFIL_BEKLEYEN.clear()
+
+    def _guncelle(ayarlar):
+        for gk, kullanicilar in bekleyen.items():
+            if gk not in ayarlar:
+                ayarlar[gk] = {}
+            if "profil_istat" not in ayarlar[gk]:
+                ayarlar[gk]["profil_istat"] = {}
+            for uk, delta in kullanicilar.items():
+                mevcut = ayarlar[gk]["profil_istat"].get(uk, {"message_count": 0, "voice_seconds": 0})
+                mevcut["message_count"] = int(mevcut.get("message_count", 0)) + int(delta.get("message_count", 0))
+                mevcut["voice_seconds"] = int(mevcut.get("voice_seconds", 0)) + int(delta.get("voice_seconds", 0))
+                ayarlar[gk]["profil_istat"][uk] = mevcut
+
+    ayarlari_guncelle(_guncelle)
+
+
+async def _profil_bekleyenleri_kaydet_dongusu():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await asyncio.sleep(20)
+            await asyncio.to_thread(_profil_bekleyenleri_kaydet)
+        except Exception as e:
+            print(f"[UYARI] Profil istat kaydetme dongusu: {e}")
+
+
+def _sureyi_formatla(toplam_saniye: int) -> str:
+    toplam_saniye = max(0, int(toplam_saniye))
+    saat, kalan = divmod(toplam_saniye, 3600)
+    dakika, saniye = divmod(kalan, 60)
+    if saat:
+        return f"{saat}s {dakika}dk"
+    if dakika:
+        return f"{dakika}dk {saniye}sn"
+    return f"{saniye}sn"
+
+
+def _toplam_xp_hesapla(level: int, xp: int) -> int:
+    toplam = int(xp)
+    for l in range(int(level)):
+        toplam += _xp_hedef(l)
+    return toplam
+
+
+def _guild_ayar_al(guild_id: int) -> dict:
+    return ayarlari_yukle().get(str(guild_id), {})
+
+
+def _guild_ayar_kismi_kaydet(guild_id: int, key: str, value):
+    def _guncelle(ayarlar):
+        gk = str(guild_id)
+        if gk not in ayarlar:
+            ayarlar[gk] = {}
+        ayarlar[gk][key] = value
+
+    ayarlari_guncelle(_guncelle)
+
+
+def _level_ayar_al(guild_id: int) -> dict:
+    veri = _guild_ayar_al(guild_id).get("level_sistemi", {})
+    return {
+        "kanal_id": veri.get("kanal_id"),
+        "mesaj": veri.get("mesaj", "Tebrikler {member_mention}, **{level}. seviye** oldun!"),
+        "gif_url": veri.get("gif_url"),
+        "rol_odulleri": veri.get("rol_odulleri", {}),
+    }
+
+
+def _level_ayar_kaydet(guild_id: int, veri: dict):
+    _guild_ayar_kismi_kaydet(guild_id, "level_sistemi", veri)
+
+
+def _welcome_ayar_al(guild_id: int) -> dict:
+    veri = _guild_ayar_al(guild_id).get("hosgeldin_sistemi", {})
+    return {
+        "kanal_id": veri.get("kanal_id"),
+        "mesaj": veri.get("mesaj", "Aramiza hos geldin {member_mention}! Sunucuda iyi eglenceler."),
+        "gif_url": veri.get("gif_url"),
+        "rol_ids": veri.get("rol_ids", []),
+    }
+
+
+def _welcome_ayar_kaydet(guild_id: int, veri: dict):
+    _guild_ayar_kismi_kaydet(guild_id, "hosgeldin_sistemi", veri)
+
+
+def _xp_hedef(level: int) -> int:
+    return 5 * (level ** 2) + (50 * level) + 100
+
+
+def _xp_veri_al(guild_id: int, user_id: int) -> dict:
+    ayarlar = ayarlari_yukle()
+    gk, uk = str(guild_id), str(user_id)
+    if gk not in ayarlar:
+        ayarlar[gk] = {}
+    if "level_xp" not in ayarlar[gk]:
+        ayarlar[gk]["level_xp"] = {}
+    if uk not in ayarlar[gk]["level_xp"]:
+        ayarlar[gk]["level_xp"][uk] = {"xp": 0, "level": 0}
+        ayarlari_kaydet(ayarlar)
+    return ayarlar[gk]["level_xp"][uk]
+
+
+def _xp_veri_kaydet(guild_id: int, user_id: int, veri: dict):
+    def _guncelle(ayarlar):
+        gk, uk = str(guild_id), str(user_id)
+        if gk not in ayarlar:
+            ayarlar[gk] = {}
+        if "level_xp" not in ayarlar[gk]:
+            ayarlar[gk]["level_xp"] = {}
+        ayarlar[gk]["level_xp"][uk] = veri
+
+    ayarlari_guncelle(_guncelle)
+
+
+def _sablon_doldur(sablon: str, uye: discord.Member, level: int = 0, xp: int = 0) -> str:
+    return sablon.format(
+        user=str(uye),
+        username=uye.name,
+        member_mention=uye.mention,
+        mention=uye.mention,
+        level=level,
+        xp=xp,
+        guild=uye.guild.name,
+        member_count=uye.guild.member_count
+    )
+
+
+def _level_odul_rollerini_coz(guild: discord.Guild, ayar: dict, level: int) -> list[discord.Role]:
+    roller = []
+    for seviye_str, rol_id in (ayar.get("rol_odulleri", {}) or {}).items():
+        try:
+            seviye = int(seviye_str)
+            rid = int(rol_id)
+        except (TypeError, ValueError):
+            continue
+        if level >= seviye:
+            rol = guild.get_role(rid)
+            if rol:
+                roller.append(rol)
+    roller.sort(key=lambda r: r.position)
+    return roller
+
+
+@bot.command(name="seviye", aliases=["level", "rank"])
+async def seviye_goster(ctx, uye: discord.Member = None):
+    hedef = uye or ctx.author
+    veri = _xp_veri_al(ctx.guild.id, hedef.id)
+    seviye = int(veri.get("level", 0))
+    xp = int(veri.get("xp", 0))
+    hedef_xp = _xp_hedef(seviye)
+    e = discord.Embed(title="Seviye Bilgisi", color=RENKLER["bilgi"], timestamp=datetime.now(timezone.utc))
+    e.add_field(name="Kullanici", value=hedef.mention, inline=True)
+    e.add_field(name="Level", value=str(seviye), inline=True)
+    e.add_field(name="XP", value=f"{xp} / {hedef_xp}", inline=True)
+    e.set_footer(text=zaman_damgasi())
+    await ctx.send(embed=e)
+
+
+@bot.command(name="levelrol")
+@commands.has_permissions(manage_guild=True)
+async def level_rol_ayarla(ctx, seviye: int = None, rol: discord.Role = None):
+    if seviye is None or rol is None:
+        await ctx.send("Kullanim: `.levelrol <seviye> @rol`")
+        return
+    if seviye < 1:
+        await ctx.send("Seviye en az 1 olmali.")
+        return
+    ayar = _level_ayar_al(ctx.guild.id)
+    oduller = dict(ayar.get("rol_odulleri", {}))
+    oduller[str(seviye)] = rol.id
+    ayar["rol_odulleri"] = oduller
+    _level_ayar_kaydet(ctx.guild.id, ayar)
+    await ctx.send(f"Level odulu kaydedildi: **{seviye}. seviye** -> {rol.mention}")
+
+
+@bot.command(name="levelrolsil")
+@commands.has_permissions(manage_guild=True)
+async def level_rol_sil(ctx, seviye: int = None):
+    if seviye is None:
+        await ctx.send("Kullanim: `.levelrolsil <seviye>`")
+        return
+    ayar = _level_ayar_al(ctx.guild.id)
+    oduller = dict(ayar.get("rol_odulleri", {}))
+    if str(seviye) not in oduller:
+        await ctx.send("Bu seviye icin kayitli bir rol odulu yok.")
+        return
+    oduller.pop(str(seviye), None)
+    ayar["rol_odulleri"] = oduller
+    _level_ayar_kaydet(ctx.guild.id, ayar)
+    await ctx.send(f"**{seviye}. seviye** rol odulu silindi.")
+
+
+@bot.command(name="levelrolleri")
+async def level_rolleri_liste(ctx):
+    ayar = _level_ayar_al(ctx.guild.id)
+    oduller = []
+    for seviye_str, rol_id in sorted((ayar.get("rol_odulleri", {}) or {}).items(), key=lambda x: int(x[0])):
+        rol = ctx.guild.get_role(int(rol_id))
+        if rol:
+            oduller.append(f"`{seviye_str}` -> {rol.mention}")
+    await ctx.send("Level rol odulleri:\n" + ("\n".join(oduller) if oduller else "Hic rol odulu ayarlanmamis."))
+
+
+@bot.command(name="profil", aliases=["profile"])
+async def profil_goster(ctx, uye: discord.Member = None):
+    hedef = uye or ctx.author
+    veri = _xp_veri_al(ctx.guild.id, hedef.id)
+    istat = _profil_istat_al(ctx.guild.id, hedef.id)
+    tum_xp = _toplam_xp_hesapla(int(veri.get("level", 0)), int(veri.get("xp", 0)))
+    tum_xp_veri = ayarlari_yukle().get(str(ctx.guild.id), {}).get("level_xp", {})
+    sirali = sorted(
+        tum_xp_veri.items(),
+        key=lambda item: _toplam_xp_hesapla(int(item[1].get("level", 0)), int(item[1].get("xp", 0))),
+        reverse=True
+    )
+    sira = next((i for i, (uid, _) in enumerate(sirali, 1) if uid == str(hedef.id)), None)
+    e = discord.Embed(
+        title=f"{hedef.display_name} • Profil",
+        color=RENKLER["bilgi"],
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name="Seviye", value=f"**{veri.get('level', 0)}**", inline=True)
+    e.add_field(name="Toplam XP", value=f"**{tum_xp}**", inline=True)
+    e.add_field(name="Siralama", value=f"**#{sira or '-'}**", inline=True)
+    e.add_field(name="Mesaj", value=f"**{istat.get('message_count', 0)}**", inline=True)
+    e.add_field(name="Ses", value=f"**{_sureyi_formatla(istat.get('voice_seconds', 0))}**", inline=True)
+    e.add_field(name="Katilim", value=hedef.joined_at.strftime("%d.%m.%Y %H:%M") if hedef.joined_at else "Bilinmiyor", inline=True)
+    if hedef.display_avatar:
+        e.set_thumbnail(url=hedef.display_avatar.url)
+    e.set_footer(text=f"{ctx.guild.name} • {zaman_damgasi()}")
+    await ctx.send(embed=e)
+
+
+@bot.command(name="hosgeldindurum")
+async def hosgeldin_durum(ctx):
+    ayar = _welcome_ayar_al(ctx.guild.id)
+    kanal = ctx.guild.get_channel(ayar.get("kanal_id")) if ayar.get("kanal_id") else None
+    roller = [ctx.guild.get_role(rid) for rid in ayar.get("rol_ids", [])]
+    roller = [r.mention for r in roller if r]
+    e = discord.Embed(title="Hosgeldin Sistemi", color=RENKLER["bilgi"], timestamp=datetime.now(timezone.utc))
+    e.add_field(name="Kanal", value=kanal.mention if kanal else "Ayarlanmamis", inline=False)
+    e.add_field(name="Mesaj", value=ayar.get("mesaj", "-"), inline=False)
+    e.add_field(name="GIF", value=ayar.get("gif_url") or "Yok", inline=False)
+    e.add_field(name="Roller", value=", ".join(roller) if roller else "Yok", inline=False)
+    await ctx.send(embed=e)
+
+
+@bot.command(name="leveldurum")
+async def level_durum(ctx):
+    ayar = _level_ayar_al(ctx.guild.id)
+    kanal = ctx.guild.get_channel(ayar.get("kanal_id")) if ayar.get("kanal_id") else None
+    rol_odulleri = []
+    for seviye_str, rol_id in sorted((ayar.get("rol_odulleri", {}) or {}).items(), key=lambda x: int(x[0])):
+        rol = ctx.guild.get_role(int(rol_id))
+        if rol:
+            rol_odulleri.append(f"`{seviye_str}` -> {rol.mention}")
+    e = discord.Embed(title="Level Sistemi", color=RENKLER["bilgi"], timestamp=datetime.now(timezone.utc))
+    e.add_field(name="Kanal", value=kanal.mention if kanal else "Ayarlanmamis", inline=False)
+    e.add_field(name="Mesaj", value=ayar.get("mesaj", "-"), inline=False)
+    e.add_field(name="GIF", value=ayar.get("gif_url") or "Yok", inline=False)
+    e.add_field(name="Rol Odulleri", value="\n".join(rol_odulleri) if rol_odulleri else "Yok", inline=False)
+    await ctx.send(embed=e)
+
+
+@bot.listen("on_member_join")
+async def hosgeldin_listener(member: discord.Member):
+    ayar = _welcome_ayar_al(member.guild.id)
+    kanal_id = ayar.get("kanal_id")
+    if not kanal_id:
+        return
+    kanal = member.guild.get_channel(kanal_id)
+    if not kanal:
+        return
+
+    rol_mentionlari = []
+    for rol_id in ayar.get("rol_ids", []):
+        rol = member.guild.get_role(rol_id)
+        if rol:
+            rol_mentionlari.append(rol.mention)
+
+    mesaj_ust = f"{member.mention}"
+    if rol_mentionlari:
+        mesaj_ust += " " + " ".join(rol_mentionlari)
+
+    e = discord.Embed(
+        title="Hos Geldin!",
+        description=_sablon_doldur(ayar.get("mesaj", ""), member),
+        color=RENKLER["giris"],
+        timestamp=datetime.now(timezone.utc)
+    )
+    if ayar.get("gif_url"):
+        e.set_image(url=ayar["gif_url"])
+    if member.display_avatar:
+        e.set_thumbnail(url=member.display_avatar.url)
+    e.set_footer(text=zaman_damgasi())
+
+    try:
+        await kanal.send(mesaj_ust, embed=e)
+    except discord.Forbidden:
+        pass
+
+
+@bot.listen("on_message")
+async def level_xp_listener(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+
+    _profil_bekleyen_arttir(message.guild.id, message.author.id, mesaj_delta=1)
+
+    anahtar = (message.guild.id, message.author.id)
+    simdi_ts = datetime.now(timezone.utc).timestamp()
+    son = _LEVEL_XP_COOLDOWN.get(anahtar, 0)
+    if (simdi_ts - son) < _LEVEL_COOLDOWN_SANIYE:
+        return
+    _LEVEL_XP_COOLDOWN[anahtar] = simdi_ts
+
+    veri = _xp_veri_al(message.guild.id, message.author.id)
+    onceki_level = int(veri.get("level", 0))
+    yeni_xp = int(veri.get("xp", 0)) + random.randint(8, 15)
+    yeni_level = onceki_level
+
+    while yeni_xp >= _xp_hedef(yeni_level):
+        yeni_xp -= _xp_hedef(yeni_level)
+        yeni_level += 1
+
+    veri["xp"] = yeni_xp
+    veri["level"] = yeni_level
+    _xp_veri_kaydet(message.guild.id, message.author.id, veri)
+
+    if yeni_level <= onceki_level:
+        return
+
+    ayar = _level_ayar_al(message.guild.id)
+    odul_rolleri = [rol for rol in _level_odul_rollerini_coz(message.guild, ayar, yeni_level) if rol not in message.author.roles]
+    if odul_rolleri:
+        try:
+            await message.author.add_roles(*odul_rolleri, reason=f"Level odulu: {yeni_level}. seviye")
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException:
+            pass
+
+    kanal_id = ayar.get("kanal_id")
+    if not kanal_id:
+        return
+    kanal = message.guild.get_channel(kanal_id)
+    if not kanal:
+        return
+
+    aciklama = _sablon_doldur(ayar.get("mesaj", ""), message.author, level=yeni_level, xp=yeni_xp)
+    e = discord.Embed(
+        title="Seviye Atladin!",
+        description=aciklama,
+        color=RENKLER["basari"],
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name="Yeni Level", value=f"**{yeni_level}**", inline=True)
+    e.add_field(name="Kalan XP", value=f"**{yeni_xp} / {_xp_hedef(yeni_level)}**", inline=True)
+    if odul_rolleri:
+        e.add_field(name="Rol Odulu", value=", ".join(rol.mention for rol in odul_rolleri), inline=False)
+    if ayar.get("gif_url"):
+        e.set_image(url=ayar["gif_url"])
+    if message.author.display_avatar:
+        e.set_thumbnail(url=message.author.display_avatar.url)
+    e.set_footer(text=zaman_damgasi())
+
+    try:
+        await kanal.send(message.author.mention, embed=e)
+    except discord.Forbidden:
+        pass
+
+
+@bot.command(name="logkurkanal", aliases=["log-kanal-kur", "logkanalkur"])
+@commands.has_permissions(manage_guild=True, manage_channels=True)
+async def log_kur_kanal_olustur(ctx):
+    kategori_ad = "LOG KANALLARI"
+    kategori = discord.utils.get(ctx.guild.categories, name=kategori_ad)
+    if kategori is None:
+        kategori = await ctx.guild.create_category(kategori_ad, reason=f"{ctx.author} tarafindan log kanallari icin olusturuldu")
+
+    ayarlar = ayarlari_yukle()
+    gk = str(ctx.guild.id)
+    if gk not in ayarlar:
+        ayarlar[gk] = {}
+
+    olusturulanlar = []
+    mevcutlar = []
+
+    for tur in LOG_TURLERI.keys():
+        kanal_adi = LOG_KANAL_KALIPLARI.get(tur, [tur])[0]
+        kanal = discord.utils.get(ctx.guild.text_channels, name=kanal_adi)
+        if kanal is None:
+            kanal = await ctx.guild.create_text_channel(
+                kanal_adi,
+                category=kategori,
+                reason=f"{ctx.author} tarafindan .logkurkanal komutu ile olusturuldu"
+            )
+            olusturulanlar.append(kanal.mention)
+        else:
+            mevcutlar.append(kanal.mention)
+            if kanal.category_id != kategori.id:
+                try:
+                    await kanal.edit(category=kategori, reason="Log kategori duzeni")
+                except discord.Forbidden:
+                    pass
+        ayarlar[gk][tur] = kanal.id
+
+    ayarlari_kaydet(ayarlar)
+
+    e = discord.Embed(
+        title="Log Kanallari Hazir",
+        description="Eksik log kanallari olusturuldu ve sisteme kaydedildi.",
+        color=RENKLER["basari"],
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name="Olusturulan", value="\n".join(olusturulanlar[:20]) if olusturulanlar else "Yeni kanal olusturulmadi.", inline=False)
+    e.add_field(name="Zaten Vardi", value="\n".join(mevcutlar[:20]) if mevcutlar else "Yok", inline=False)
+    e.set_footer(text=zaman_damgasi())
+    await ctx.send(embed=e)
+
+
+# ─────────────────────────────────────────
+#  MODAL TABANLI LEVEL / HOSGELDIN KURULUMU
+# ─────────────────────────────────────────
+
+class LevelKurModal(discord.ui.Modal, title="Level Sistemi Kurulumu"):
+    kanal_id = discord.ui.TextInput(
+        label="Level duyuru kanal ID",
+        placeholder="Ornek: 123456789012345678",
+        required=True,
+        max_length=25
+    )
+    mesaj = discord.ui.TextInput(
+        label="Level atlama mesaji",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=1000,
+        default="Tebrikler {member_mention}, {level}. seviyeye ulastin!"
+    )
+    gif_url = discord.ui.TextInput(
+        label="GIF URL (opsiyonel, kapat/sil yazarsan temizler)",
+        required=False,
+        max_length=500
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            kanal_id = int((self.kanal_id.value or "").strip())
+        except ValueError:
+            await interaction.response.send_message("Gecersiz kanal ID girdin.", ephemeral=True)
+            return
+
+        kanal = interaction.guild.get_channel(kanal_id) if interaction.guild else None
+        if not isinstance(kanal, discord.TextChannel):
+            await interaction.response.send_message("Bu ID ile metin kanali bulunamadi.", ephemeral=True)
+            return
+
+        ayar = _level_ayar_al(interaction.guild.id)
+        ayar["kanal_id"] = kanal.id
+        ayar["mesaj"] = (self.mesaj.value or "").strip()
+
+        gif_raw = (self.gif_url.value or "").strip()
+        if gif_raw.lower() in ("", "kapat", "sil", "off", "none"):
+            ayar["gif_url"] = None
+        else:
+            ayar["gif_url"] = gif_raw
+
+        _level_ayar_kaydet(interaction.guild.id, ayar)
+        await interaction.response.send_message(
+            f"Level sistemi modal ile kaydedildi.\nKanal: {kanal.mention}",
+            ephemeral=True
+        )
+
+
+class HosgeldinKurModal(discord.ui.Modal, title="Hosgeldin Sistemi Kurulumu"):
+    kanal_id = discord.ui.TextInput(
+        label="Hosgeldin kanal ID",
+        placeholder="Ornek: 123456789012345678",
+        required=True,
+        max_length=25
+    )
+    mesaj = discord.ui.TextInput(
+        label="Hosgeldin mesaji",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=1000,
+        default="Hos geldin {member_mention}! Keyifli vakit gecirmen dilegiyle."
+    )
+    gif_url = discord.ui.TextInput(
+        label="GIF URL (opsiyonel)",
+        required=False,
+        max_length=500
+    )
+    rol_ids = discord.ui.TextInput(
+        label="Etiket rol ID'leri (virgulle, opsiyonel)",
+        placeholder="123,456,789",
+        required=False,
+        max_length=300
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            kanal_id = int((self.kanal_id.value or "").strip())
+        except ValueError:
+            await interaction.response.send_message("Gecersiz kanal ID girdin.", ephemeral=True)
+            return
+
+        kanal = interaction.guild.get_channel(kanal_id) if interaction.guild else None
+        if not isinstance(kanal, discord.TextChannel):
+            await interaction.response.send_message("Bu ID ile metin kanali bulunamadi.", ephemeral=True)
+            return
+
+        rol_listesi = []
+        rol_ham = (self.rol_ids.value or "").strip()
+        if rol_ham:
+            for parca in rol_ham.split(","):
+                parca = parca.strip().replace("<@&", "").replace(">", "")
+                if not parca:
+                    continue
+                if parca.isdigit():
+                    rid = int(parca)
+                    if interaction.guild.get_role(rid):
+                        rol_listesi.append(rid)
+
+        ayar = _welcome_ayar_al(interaction.guild.id)
+        ayar["kanal_id"] = kanal.id
+        ayar["mesaj"] = (self.mesaj.value or "").strip()
+        ayar["rol_ids"] = list(dict.fromkeys(rol_listesi))
+
+        gif_raw = (self.gif_url.value or "").strip()
+        if gif_raw.lower() in ("", "kapat", "sil", "off", "none"):
+            ayar["gif_url"] = None
+        else:
+            ayar["gif_url"] = gif_raw
+
+        _welcome_ayar_kaydet(interaction.guild.id, ayar)
+        await interaction.response.send_message(
+            f"Hosgeldin sistemi modal ile kaydedildi.\nKanal: {kanal.mention}",
+            ephemeral=True
+        )
+
+
+class _KurulumView(discord.ui.View):
+    def __init__(self, modal_tipi: str):
+        super().__init__(timeout=None)
+        self.modal_tipi = modal_tipi
+
+    @discord.ui.button(label="Modal Ac", style=discord.ButtonStyle.primary)
+    async def modal_ac(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if self.modal_tipi == "level":
+                await interaction.response.send_modal(LevelKurModal())
+            else:
+                await interaction.response.send_modal(HosgeldinKurModal())
+        except Exception as e:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"Modal acilirken hata olustu: {e}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"Modal acilirken hata olustu: {e}", ephemeral=True)
+
+
+@bot.command(name="levelkur")
+@commands.has_permissions(manage_guild=True)
+async def level_kur_modal(ctx):
+    e = discord.Embed(
+        title="Level Sistemi Kurulumu",
+        description="Asagidaki butona tikla, ayarlari modal uzerinden gir.",
+        color=RENKLER["bilgi"]
+    )
+    await ctx.send(embed=e, view=_KurulumView("level"))
+
+
+@bot.command(name="hosgeldinkur")
+@commands.has_permissions(manage_guild=True)
+async def hosgeldin_kur_modal(ctx):
+    e = discord.Embed(
+        title="Hosgeldin Sistemi Kurulumu",
+        description="Asagidaki butona tikla, ayarlari modal uzerinden gir.",
+        color=RENKLER["bilgi"]
+    )
+    await ctx.send(embed=e, view=_KurulumView("hosgeldin"))
+
+
+@bot.command(name="levelmesajtest")
+@commands.has_permissions(manage_guild=True)
+async def level_mesaj_test(ctx, uye: discord.Member = None):
+    hedef = uye or ctx.author
+    ayar = _level_ayar_al(ctx.guild.id)
+    aciklama = _sablon_doldur(ayar.get("mesaj", "Tebrikler {member_mention}, {level}. seviye oldun!"), hedef, level=5, xp=42)
+    e = discord.Embed(
+        title="Seviye Atladin! (Test)",
+        description=aciklama,
+        color=RENKLER["basari"],
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name="Yeni Level", value="**5**", inline=True)
+    e.add_field(name="Kalan XP", value="**42 / 475**", inline=True)
+    if ayar.get("gif_url"):
+        e.set_image(url=ayar["gif_url"])
+    if hedef.display_avatar:
+        e.set_thumbnail(url=hedef.display_avatar.url)
+    e.set_footer(text=zaman_damgasi())
+    await ctx.send(hedef.mention, embed=e)
+
+
+@bot.command(name="hosgeldinmesajtest")
+@commands.has_permissions(manage_guild=True)
+async def hosgeldin_mesaj_test(ctx, uye: discord.Member = None):
+    hedef = uye or ctx.author
+    ayar = _welcome_ayar_al(ctx.guild.id)
+
+    rol_mentionlari = []
+    for rid in ayar.get("rol_ids", []):
+        rol = ctx.guild.get_role(rid)
+        if rol:
+            rol_mentionlari.append(rol.mention)
+
+    ust_metin = hedef.mention
+    if rol_mentionlari:
+        ust_metin += " " + " ".join(rol_mentionlari)
+
+    e = discord.Embed(
+        title="Hos Geldin! (Test)",
+        description=_sablon_doldur(ayar.get("mesaj", "Hos geldin {member_mention}!"), hedef),
+        color=RENKLER["giris"],
+        timestamp=datetime.now(timezone.utc)
+    )
+    if ayar.get("gif_url"):
+        e.set_image(url=ayar["gif_url"])
+    if hedef.display_avatar:
+        e.set_thumbnail(url=hedef.display_avatar.url)
+    e.set_footer(text=zaman_damgasi())
+    await ctx.send(ust_metin, embed=e)
 
 
 app = Flask(__name__)
